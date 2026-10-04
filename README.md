@@ -444,3 +444,10 @@ bun run test:emulator   # the Firestore emulator with huishouden/rules' rules (a
 The tests use the real household rules in the Firestore emulator. Google (OAuth, Calendar API,
 batches) and Firebase Auth are faked. D1 is SQLite and KV is a map. Test data is invented
 (`example.com` addresses, a `demo-` project).
+
+## License
+
+Source available under [PolyForm Shield 1.0.0](LICENSE): you may use, study and modify this code
+for any purpose except providing a product that competes with Huishouden.
+
+Huishouden and its logo are the project's brand; please don't use them for other products.
