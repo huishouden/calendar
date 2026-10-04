@@ -1,5 +1,5 @@
 import { toMailMessage } from '@huishouden/pwa-kit/mail-core';
-import { dayOf, planAlerts, transactionDoc, MAX_ALERTS, type Existing } from '@huishouden/pwa-kit/spending-core';
+import { MAX_ALERTS, transactionDoc } from '@huishouden/pwa-kit/spending-core';
 import type { Env, Fetch } from '../env';
 import { log } from '../log';
 import { overQuota, signInGone } from '../person';
@@ -7,7 +7,9 @@ import { accessToken, GoogleAuthError, revokeGoogle } from '../google/oauth';
 import { REQUEUE_MS, type WorkOutcome } from '../work';
 import { Gmail, gmailRateLimited } from './gmail';
 import { actingAs, readConfig, refused, reportInbox, searchFor } from './inbox';
-import { deleteInbox, markSeen, openConfig, openRecord, sealConfig, SEEN_KEEP_MS, unseen, type InboxConfig, type InboxRow } from './store';
+import { existingFrom, PARSER_VERSION, readMessages, recheckUnit } from './recheck';
+import { recordShape, SHAPES_KEEP_MS } from './shape';
+import { deleteInbox, markSeen, newImportId, openConfig, openRecord, putReview, sealConfig, SEEN_KEEP_MS, unseen, type InboxConfig, type InboxRow, type SeenState } from './store';
 
 /**
  * One unit of an inbox's import, in its own invocation (a queue message `{ inbox }`, or the next
@@ -130,22 +132,19 @@ export async function runMailWork(env: Env, id: string, deps: MailWorkDeps = {})
     const more = fresh.length > batch.length;
     let added = 0;
     let duplicates = 0;
+    let review = 0;
+    let importId = row.import_open && row.import_id ? row.import_id : null;
     if (batch.length) {
+      importId ??= newImportId(now);
       const messages = (await Promise.all(batch.map((m) => gmail.get(m)))).map(toMailMessage);
-      const from = dayOf(Math.min(...messages.map((m) => m.date)) - 4 * 86_400_000, record.timeZone);
-      const existing: Existing[] = (await person.db.query(person.base, 'spendingTransactions', { where: [{ field: 'date', op: 'GREATER_THAN_OR_EQUAL', value: from }] })).map((d) => ({
-        id: d.id,
-        date: String(d.data.date ?? ''),
-        description: String(d.data.description ?? ''),
-        amount: typeof d.data.amount === 'number' ? d.data.amount : Number(d.data.amount) || 0,
-        card: String(d.data.card ?? ''),
-        source: String(d.data.source ?? 'statement'),
-      }));
-      const plan = planAlerts(messages, { cards: config.cards, rules: config.rules, existing, timeZone: record.timeZone });
+      const read = readMessages(messages, config, record.timeZone);
+      const existing = await existingFrom(person, messages, record.timeZone);
+      const plan = read.plan(existing);
       added = plan.create.length;
       duplicates = plan.duplicates;
+      review = plan.review.length;
       if (added) {
-        await person.db.commit(plan.create.map((tx) => ({ path: `${person.base}/spendingTransactions/${tx.id}`, set: transactionDoc(tx, 'alert', record.email, now) })));
+        await person.db.commit(plan.create.map((tx) => ({ path: `${person.base}/spendingTransactions/${tx.id}`, set: transactionDoc({ ...tx, importId: importId! }, 'alert', record.email, now) })));
       }
       // The document says what was found (and that the inbox works again); gone means disconnected.
       const present = await reportInbox(person, id, added ? { lastAlertAt: now, lastAdded: added, error: null } : { error: null }, now);
@@ -155,10 +154,37 @@ export async function runMailWork(env: Env, id: string, deps: MailWorkDeps = {})
         log('mail', { unit: true, gone: true });
         return { done: true };
       }
+      const created = new Set(plan.create.map((t) => t.emailId));
+      const asked = new Set(plan.review.map((r) => r.emailId));
+      const states = read.readings.map(({ msg, reading }) => ({
+        msg: msg.id,
+        state: (created.has(msg.id) ? 'imported' : asked.has(msg.id) ? 'review' : reading.kind === 'purchase' ? 'duplicate' : 'skipped') as SeenState,
+        importId: created.has(msg.id) || asked.has(msg.id) ? importId : null,
+        parsed: PARSER_VERSION,
+      }));
+      const starting = !(row.import_open && row.import_id);
       await env.DB.batch([
-        ...markSeen(env, id, batch, now),
+        ...markSeen(env, id, states, now),
+        ...(await Promise.all(plan.review.map((r) => putReview(env, id, { msg: r.emailId, subject: r.subject, sent: r.sent, date: r.date, amount: r.amount ?? null, reason: r.reason }, importId, now)))),
+        ...read.readings.map(({ msg, reading }) => recordShape(env, id, msg, reading, now)),
+        env.DB.prepare(
+          `UPDATE inboxes SET import_id = ?1, import_at = ?2, import_added = CASE WHEN ?3 THEN 0 ELSE import_added END + ?4,
+             import_review = CASE WHEN ?3 THEN 0 ELSE import_review END + ?5, import_undone = 0, import_open = ?6 WHERE id = ?7`,
+        ).bind(importId, now, starting ? 1 : 0, added, review, more ? 1 : 0, id),
         env.DB.prepare('DELETE FROM inbox_seen WHERE inbox = ? AND at < ?').bind(id, now - SEEN_KEEP_MS),
+        env.DB.prepare('DELETE FROM mail_shapes WHERE inbox = ? AND at < ?').bind(id, now - SHAPES_KEEP_MS),
       ]);
+    } else if (row.rechecked < PARSER_VERSION) {
+      // Nothing new: past imports are read again with the current parser, a few emails a unit.
+      const r = await recheckUnit(env, row, record, person, gmail, config, now);
+      if (r.more) {
+        await release('checked_at = ?, queued_at = ?', now, now);
+        log('mail', { unit: true, recheck: true, ...r.totals, more: true });
+        if (deps.next) await deps.next(id).catch(() => sendMail(env, id));
+        else await sendMail(env, id);
+        return { done: true };
+      }
+      log('mail', { unit: true, recheck: true, ...r.totals, more: false });
     } else if (row.error) {
       await reportInbox(person, id, { error: null }, now);
     }
@@ -170,7 +196,7 @@ export async function runMailWork(env: Env, id: string, deps: MailWorkDeps = {})
       more ? now : null,
       ...(added ? [now, added] : []),
     );
-    log('mail', { unit: true, found: found.length, read: batch.length, added, duplicates, more });
+    log('mail', { unit: true, found: found.length, read: batch.length, added, duplicates, review, more });
     if (more) {
       if (deps.next) await deps.next(id).catch(() => sendMail(env, id));
       else await sendMail(env, id);

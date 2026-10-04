@@ -10,8 +10,9 @@ import { exchangeCode, GMAIL_SCOPE, GoogleAuthError, revokeGoogle } from '../goo
 import { Gmail, GmailApiError } from './gmail';
 import { actingAs, inboxDoc } from './inbox';
 import { MAIL_EVERY_MIN } from './check';
-import { deleteInbox, householdInboxes, inboxIdOf, inboxRow, lastMailTick, openRecord, putInbox, STOPPED, type InboxRecord } from './store';
+import { deleteInbox, householdInboxes, inboxIdOf, inboxRow, lastMailTick, listReview, openRecord, putInbox, reviewCount, STOPPED, type InboxRecord, type InboxRow, type ReviewItem } from './store';
 import { markMailWork } from './work';
+import { PARSER_VERSION } from './recheck';
 
 /**
  * Spending's calls about alert inboxes, as the signed-in member (admins and members only: helpers
@@ -26,6 +27,12 @@ import { markMailWork } from './work';
  * - `POST /api/mail/check`: check every inbox now, with the household's latest cards and rules.
  * - `POST /api/mail/disconnect`: `inbox`; the member who connected it or an admin. Google's grant
  *   is revoked and everything kept for it deleted.
+ * - `GET  /api/mail/review?household=&inbox=`: the emails that couldn't be read (subject, date, the
+ *   amount seen), for the member who connected the inbox only: it is their mail.
+ * - `POST /api/mail/review`: `inbox`, `msg`, `answer` (`not-purchase` or `entered`): the email leaves
+ *   the list and is never written by a re-read.
+ * - `POST /api/mail/undo`: `inbox`, `importId`; the member who connected it or an admin. Deletes, as
+ *   the caller, the transactions that import wrote; their emails are never written again.
  */
 
 export interface MailCaller {
@@ -63,6 +70,10 @@ export interface InboxStatus {
   lastAdded: number | null;
   error: string | null;
   checking: boolean;
+  /** The last import that read anything: "Last import: N added, M need review", and Undo. */
+  lastImport: { id: string; at: number; added: number; review: number; done: boolean; undone: boolean } | null;
+  /** Emails waiting for the member's answer (only the member who connected the inbox sees them). */
+  review: number;
 }
 
 export interface MailStatus {
@@ -95,6 +106,8 @@ export async function mailStatus(env: Env, who: MailCaller): Promise<MailStatus>
       lastAdded: row.added,
       error: row.error,
       checking: row.pending !== 0 && !stopped,
+      lastImport: row.import_id && row.import_at ? { id: row.import_id, at: row.import_at, added: row.import_added, review: row.import_review, done: !row.import_open, undone: !!row.import_undone } : null,
+      review: await reviewCount(env, row.id),
     });
   }
   const checks = inboxes.map((i) => i.lastChecked ?? 0).filter(Boolean);
@@ -158,7 +171,7 @@ export async function connectInbox(env: Env, who: MailCaller, b: Record<string, 
   const before = await inboxRow(env, id);
   const previous = before ? await openRecord(env, before) : null;
   if (previous && previous.google !== granted.refreshToken) await revokeGoogle(previous.google, deps.fetch);
-  await putInbox(env, id, record, { since: await backfillFrom(person, now), historyId: profile.historyId || null, now });
+  await putInbox(env, id, record, { since: await backfillFrom(person, now), historyId: profile.historyId || null, now, parserVersion: PARSER_VERSION });
   await markMailWork(env, id, now);
   log('api', { route: 'mail-connect', ok: true, again: !!before });
   return mailStatus(env, who);
@@ -200,5 +213,72 @@ export async function disconnectInbox(env: Env, who: MailCaller, b: Record<strin
     await deleteInbox(env, b.inbox);
   }
   log('api', { route: 'mail-disconnect', ok: true });
+  return mailStatus(env, who);
+}
+
+const inboxParam = (v: unknown): string => {
+  if (typeof v !== 'string' || !/^ib-[A-Za-z0-9_-]{1,61}$/.test(v)) throw new MailHttpError(400, 'inbox');
+  return v;
+};
+
+/** The household's inbox and who connected it, or 404. */
+async function ownInbox(env: Env, who: MailCaller, id: string): Promise<{ row: InboxRow; record: InboxRecord }> {
+  const row = await inboxRow(env, id);
+  const record = row && row.hh === (await householdKey(who.household)) ? await openRecord(env, row) : null;
+  if (!row || !record) throw new MailHttpError(404, 'inbox');
+  return { row, record };
+}
+
+export async function reviewList(env: Env, who: MailCaller, inbox: unknown): Promise<{ items: ReviewItem[] }> {
+  staffOnly(who);
+  const { record } = await ownInbox(env, who, inboxParam(inbox));
+  if (record.email !== who.email) throw new MailHttpError(403, 'not-allowed');
+  return { items: await listReview(env, inboxParam(inbox)) };
+}
+
+export async function answerReview(env: Env, who: MailCaller, b: Record<string, unknown>, deps: MailDeps): Promise<{ items: ReviewItem[] }> {
+  staffOnly(who);
+  const id = inboxParam(b.inbox);
+  const { record } = await ownInbox(env, who, id);
+  if (record.email !== who.email) throw new MailHttpError(403, 'not-allowed');
+  if (typeof b.msg !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(b.msg)) throw new MailHttpError(400, 'msg');
+  if (b.answer !== 'not-purchase' && b.answer !== 'entered') throw new MailHttpError(400, 'answer');
+  const now = deps.now ?? Date.now();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM inbox_review WHERE inbox = ? AND msg = ?').bind(id, b.msg),
+    env.DB.prepare('UPDATE inbox_seen SET state = ? WHERE inbox = ? AND msg = ?').bind(b.answer === 'entered' ? 'entered' : 'dismissed', id, b.msg),
+    env.DB.prepare('UPDATE inboxes SET import_review = MAX(0, import_review - 1) WHERE id = ? AND import_id = (SELECT import_id FROM inbox_seen WHERE inbox = ? AND msg = ?)').bind(id, id, b.msg),
+  ]);
+  log('api', { route: 'mail-review', ok: true, answer: b.answer, at: now });
+  return { items: await listReview(env, id) };
+}
+
+export async function undoImport(env: Env, who: MailCaller, b: Record<string, unknown>, deps: MailDeps): Promise<MailStatus> {
+  staffOnly(who);
+  const id = inboxParam(b.inbox);
+  const { row, record } = await ownInbox(env, who, id);
+  if (record.email !== who.email && who.role !== 'admin') throw new MailHttpError(403, 'not-allowed');
+  if (typeof b.importId !== 'string' || b.importId !== row.import_id) throw new MailHttpError(409, 'not-last-import');
+  // As the caller: the household's rules decide.
+  const db = new FirestoreRest({
+    projectId: env.FIREBASE_PROJECT_ID,
+    token: async () => who.idToken,
+    ...(deps.fetch ? { fetch: deps.fetch } : {}),
+    ...((deps.firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: deps.firestoreUrl ?? env.FIRESTORE_URL } : {}),
+  });
+  const base = `households/${who.household}`;
+  let docs;
+  try {
+    docs = await db.query(base, 'spendingTransactions', { where: [{ field: 'importId', op: 'EQUAL', value: b.importId }] });
+    for (let i = 0; i < docs.length; i += 400) await db.commit(docs.slice(i, i + 400).map((d) => ({ path: `${base}/spendingTransactions/${d.id}`, delete: true as const })));
+  } catch (e) {
+    if (e instanceof FirestoreError && e.code === 'permission-denied') throw new MailHttpError(403, 'not-allowed');
+    throw e;
+  }
+  await env.DB.batch([
+    env.DB.prepare("UPDATE inbox_seen SET state = 'undone' WHERE inbox = ? AND import_id = ? AND state = 'imported'").bind(id, b.importId),
+    env.DB.prepare('UPDATE inboxes SET import_undone = 1 WHERE id = ?').bind(id),
+  ]);
+  log('api', { route: 'mail-undo', ok: true, deleted: docs.length });
   return mailStatus(env, who);
 }

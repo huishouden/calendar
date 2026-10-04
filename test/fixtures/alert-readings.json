@@ -1,0 +1,72 @@
+[
+  {
+    "name": "Visa Purchase Alerts subject: amount, merchant and card from the one wording",
+    "email": { "from": "Visa Purchase Alerts <DoNotReplyVisaPurchaseAlerts@visa.com>", "subject": "Visa Purchase Alerts: 19.99 USD at EXAMPLE MUSIC P12AB in +15555550100 on Card 1111", "text": "A purchase was made on your card.", "bulk": true },
+    "expected": { "kind": "purchase", "rule": "visa-alert", "tx": { "date": "2031-10-02", "description": "EXAMPLE MUSIC P12AB", "amount": 19.99, "category": "Miscellaneous", "card": "Card One", "type": "Sale", "last4": "1111" } }
+  },
+  {
+    "name": "Issuer table: merchant, amount and the transaction's own date from labelled cells",
+    "email": { "from": "Example Bank <alerts@bank.example.com>", "subject": "Your transaction alert", "html": "<table><tr><td>Merchant</td><td>EXAMPLE GROCERY #12</td></tr><tr><td>Amount</td><td>$45.76</td></tr><tr><td>Date</td><td>Sep 30, 2031 at 6:12 PM ET</td></tr></table><p>Card ending in 2222</p>" },
+    "expected": { "kind": "purchase", "rule": "labelled", "tx": { "date": "2031-09-30", "description": "EXAMPLE GROCERY #12", "amount": 45.76, "category": "Groceries", "card": "Card Two", "type": "Sale", "last4": "2222" } }
+  },
+  {
+    "name": "A date in the purchase's sentence is the transaction's day",
+    "email": { "from": "alerts@bank.example.com", "subject": "Transaction alert", "text": "You made a $12.50 transaction with EXAMPLE DINER on 10/01/2031 on your card ending in 1111." },
+    "expected": { "kind": "purchase", "rule": "transaction-with", "tx": { "date": "2031-10-01", "description": "EXAMPLE DINER", "amount": 12.5, "category": "Dining & Food", "card": "Card One", "type": "Sale", "last4": "1111" } }
+  },
+  {
+    "name": "A date far from the email is not the transaction's (a due date, say): the email's day",
+    "email": { "from": "alerts@bank.example.com", "subject": "Transaction alert", "text": "You made a $12.50 transaction with EXAMPLE DINER on your card ending in 1111.\nDate: Aug 1, 2031" },
+    "expected": { "kind": "purchase", "rule": "transaction-with", "tx": { "date": "2031-10-02", "description": "EXAMPLE DINER", "amount": 12.5, "category": "Dining & Food", "card": "Card One", "type": "Sale", "last4": "1111" } }
+  },
+  {
+    "name": "The amount is the purchase's, not the first in the email",
+    "email": { "from": "alerts@bank.example.com", "subject": "Alert: your $500.00 limit", "text": "Your alert limit is $500.00.\nYou spent $8.20 at EXAMPLE KIOSK with your card ending in 1111." },
+    "expected": { "kind": "purchase", "rule": "spent-at", "tx": { "date": "2031-10-02", "description": "EXAMPLE KIOSK", "amount": 8.2, "category": "Miscellaneous", "card": "Card One", "type": "Sale", "last4": "1111" } }
+  },
+  {
+    "name": "Loose wording is never a merchant: 'at a reasonable price' in an offer sent to a list",
+    "email": { "from": "Example Invest <notifications@invest.example.com>", "subject": "Trade options at a reasonable price", "text": "Trade options at a reasonable price. Contracts from $0.03 each.\nUnsubscribe", "bulk": true },
+    "expected": { "kind": "not-purchase", "reason": "bulk" }
+  },
+  {
+    "name": "An investing account's order filled is not a purchase",
+    "email": { "from": "Example Invest <notifications@invest.example.com>", "subject": "Your order has been filled", "text": "Your limit order to buy 2 shares of EXMPL was filled at an average price of $115.00 per share.", "bulk": true },
+    "expected": { "kind": "not-purchase", "reason": "bulk" }
+  },
+  {
+    "name": "A deposit is not a purchase",
+    "email": { "from": "Example Invest <notifications@invest.example.com>", "subject": "Your deposit is complete", "text": "Your deposit of $6,000.00 has completed and is available to invest." },
+    "expected": { "kind": "not-purchase", "reason": "bulk" }
+  },
+  {
+    "name": "A purchase word but a merchant made of prose: asked about, not written",
+    "email": { "from": "alerts@bank.example.com", "subject": "Card alert", "text": "You spent $33.00 at a reasonable price on your card ending in 1111." },
+    "expected": { "kind": "unreadable", "reason": "generic-merchant", "date": "2031-10-02", "amount": 33 }
+  },
+  {
+    "name": "An amount and a purchase word but no merchant: asked about, not written as 'Card Purchase'",
+    "email": { "from": "alerts@bank.example.com", "subject": "Card purchase", "text": "A charge was made on your card ending in 1111 for $40.03." },
+    "expected": { "kind": "unreadable", "reason": "no-merchant", "date": "2031-10-02", "amount": 40.03 }
+  },
+  {
+    "name": "A statement notice is not a purchase",
+    "email": { "from": "alerts@bank.example.com", "subject": "Your statement is ready", "text": "Your statement is available. New balance $1,234.56. Minimum payment due $35.00." },
+    "expected": { "kind": "not-purchase", "reason": "statement" }
+  },
+  {
+    "name": "A security notice is not a purchase",
+    "email": { "from": "alerts@bank.example.com", "subject": "Your sign-in code", "text": "Your one-time sign-in code is 123456. Purchases over $500.00 need it." },
+    "expected": { "kind": "not-purchase", "reason": "security" }
+  },
+  {
+    "name": "A declined charge is not a purchase",
+    "email": { "from": "alerts@bank.example.com", "subject": "Charge declined", "text": "A $12.00 transaction with EXAMPLE KIOSK was declined." },
+    "expected": { "kind": "not-purchase", "reason": "declined" }
+  },
+  {
+    "name": "A newsletter with an amount and no purchase wording is not asked about",
+    "email": { "from": "news@shop.example.com", "subject": "This week only", "text": "Everything under $20.00 this week.", "bulk": true },
+    "expected": { "kind": "not-purchase", "reason": "bulk" }
+  }
+]

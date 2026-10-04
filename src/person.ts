@@ -94,7 +94,7 @@ export class Person {
   }
 
   /** Several documents in one request (`documents:batchGet`), in order; null for a missing one. */
-  private async getAll(paths: string[]): Promise<(Record<string, unknown> | null)[]> {
+  async getAll(paths: string[]): Promise<(Record<string, unknown> | null)[]> {
     const root = `projects/${this.env.FIREBASE_PROJECT_ID}/databases/(default)/documents`;
     let res: Response;
     try {

@@ -94,6 +94,10 @@ export async function writeDoc(path: string, data: Record<string, unknown>): Pro
   await seed({ [path]: data });
 }
 
+export async function deleteDoc(path: string): Promise<void> {
+  await owner('DELETE', `${FIRESTORE}/${ROOT}/${path}`);
+}
+
 export interface World {
   env: Env & { TOKENS: KVNamespace & { map: Map<string, string> } };
   /** Messages on the work queue (a person's, or an alert inbox's), oldest first; `drain` runs them. */

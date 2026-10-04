@@ -11,7 +11,7 @@ import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, revokeGoogl
 import { deletePerson, deletePersonRows, loadPerson, moveFeed, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
 import { lastChecked } from './tick';
 import { FEED, markWork, SYNC } from './work';
-import { checkNow, connectInbox, disconnectInbox, MailHttpError, mailStatus } from './mail/api';
+import { answerReview, checkNow, connectInbox, disconnectInbox, MailHttpError, mailStatus, reviewList, undoImport } from './mail/api';
 
 /**
  * What the portal's Calendar page calls, as the signed-in person (their Firebase ID token in
@@ -279,6 +279,12 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
         return json(200, await checkNow(env, who, { ...deps, now }), headers);
       case 'POST /api/mail/disconnect':
         return json(200, await disconnectInbox(env, who, b, { ...deps, now }), headers);
+      case 'GET /api/mail/review':
+        return json(200, await reviewList(env, who, url.searchParams.get('inbox')), headers);
+      case 'POST /api/mail/review':
+        return json(200, await answerReview(env, who, b, { ...deps, now }), headers);
+      case 'POST /api/mail/undo':
+        return json(200, await undoImport(env, who, b, { ...deps, now }), headers);
       case 'POST /api/notice/clear': {
         await upsertPersonRow(env, who.pid, { notice: null }, now);
         return json(200, await status(env, request, who), headers);

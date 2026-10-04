@@ -79,7 +79,7 @@ describe('connecting an alert inbox', () => {
     const docs = await alerts();
     expect(docs.map((d) => d.data.description).sort()).toEqual(['BOOKSHOP', 'NOODLE BAR']);
     expect(docs.find((d) => d.data.description === 'NOODLE BAR')!.data).toEqual({
-      date: '2031-09-29', description: 'NOODLE BAR', amount: 12.3, category: 'Miscellaneous', card: 'Card One', type: 'Sale', source: 'alert', last4: '1111', emailId: expect.any(String), createdAt: w.clock.now, by: 'bob@example.com',
+      date: '2031-09-29', description: 'NOODLE BAR', amount: 12.3, category: 'Miscellaneous', card: 'Card One', type: 'Sale', source: 'alert', last4: '1111', emailId: expect.any(String), importId: expect.stringMatching(/^im-/), createdAt: w.clock.now, by: 'bob@example.com',
     });
     const inbox = await readDoc(`${H}/spendingInboxes/${id}`);
     expect(inbox).toMatchObject({ lastAlertAt: w.clock.now, lastAdded: 2 });
@@ -336,6 +336,7 @@ test('parity: every fixture becomes the same transaction document in the Worker 
   expect(app.create.length).toBe(fixtures.filter((f) => f.expected !== null).length);
   for (const tx of app.create) {
     const doc = worker.find((d) => d.id === tx.id);
-    expect(doc?.data).toEqual(transactionDoc(tx, 'alert', 'bob@example.com', doc!.data.createdAt as number));
+    expect(doc?.data.importId).toMatch(/^im-/);
+    expect(doc?.data).toEqual(transactionDoc({ ...tx, importId: doc!.data.importId as string }, 'alert', 'bob@example.com', doc!.data.createdAt as number));
   }
 });
