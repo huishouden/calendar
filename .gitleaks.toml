@@ -1,0 +1,10 @@
+# Copy of the leak rules in huishouden/pwa-kit (actions/leak-scan/gitleaks.toml), so the pre-commit
+# hook works without the kit installed. CI scans with the kit's own copy as well.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "personal-email"
+description = "Address at a personal mailbox provider (people's accounts belong in data, not code)"
+regex = '''[a-zA-Z0-9._%+-]+@(?:gmail|googlemail|icloud|me|mac|outlook|hotmail|live|yahoo|aol|proton|protonmail|pm)\.(?:com|me|net)'''
+keywords = ["@gmail", "@googlemail", "@icloud", "@me.", "@mac.", "@outlook", "@hotmail", "@live.", "@yahoo", "@aol", "@proton", "@pm."]

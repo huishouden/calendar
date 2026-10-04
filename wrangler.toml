@@ -1,0 +1,64 @@
+# Huishouden calendar: each person's household calendar as a subscribed feed, and a two-way sync
+# with a "Huishouden" calendar in their Google account. Acts only as the person (their Firebase
+# sign-in), so the household's Firestore rules decide what it reads and writes.
+name = "huishouden-calendar"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[observability]
+enabled = true
+
+# Feed secrets' records and each person's tokens, sealed (AES-GCM, src/seal.ts).
+[[kv_namespaces]]
+binding = "TOKENS"
+id = "5109659c2f0e4309b8921833001e5cc8"
+
+# Sync state: which Google event stands for which agenda item, hashes, sync tokens, the last feed.
+[[d1_databases]]
+binding = "DB"
+database_name = "huishouden-calendar"
+database_id = "ddce9c93-4af7-4e42-84fc-6bf68389968c"
+migrations_dir = "migrations"
+
+# Public values. Secrets are set with `bunx wrangler secret put`, never written here:
+#   SEAL_KEY              32 random bytes, base64 (`bun run seal-key`): seals tokens in KV
+#   GOOGLE_CLIENT_SECRET  the web OAuth client's secret (README, "Google Calendar sync")
+#   FIREBASE_API_KEY      the web API key every app ships: public, but kept out of the repo so the
+#                         leak scan stays strict (the portal's VITE_FIREBASE_API_KEY variable)
+[vars]
+FIREBASE_PROJECT_ID = "huishouden-piekstra"
+# The OAuth web client Firebase made for Google sign-in (public).
+GOOGLE_CLIENT_ID = "865471112898-s88n43rlk8m2iv200lmejmj5k4rrb2sh.apps.googleusercontent.com"
+# The suite's site: the portal's Calendar page calls this Worker from here.
+SITE_URL = "https://huishouden-piekstra.web.app"
+ALLOWED_ORIGINS = "https://huishouden-piekstra.web.app"
+CALENDAR_NAME = "Huishouden"
+
+[env.staging]
+name = "huishouden-calendar-staging"
+workers_dev = true
+
+[env.staging.triggers]
+crons = ["*/5 * * * *"]
+
+[[env.staging.kv_namespaces]]
+binding = "TOKENS"
+id = "746ffd1dbaa74793bf6a00e8e90c278a"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "huishouden-calendar-staging"
+database_id = "e9e4ca03-843c-4e05-8e75-f917529bf66c"
+migrations_dir = "migrations"
+
+[env.staging.vars]
+FIREBASE_PROJECT_ID = "huishouden-staging"
+GOOGLE_CLIENT_ID = "212329703141-k8rtusehnq9a7c7okd3e6c8md99u7gj2.apps.googleusercontent.com"
+SITE_URL = "https://huishouden-staging.web.app"
+ALLOWED_ORIGINS = "https://huishouden-staging.web.app http://localhost:5173 http://127.0.0.1:5173"
+CALENDAR_NAME = "Huishouden (staging)"
