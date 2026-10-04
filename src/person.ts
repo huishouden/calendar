@@ -4,6 +4,7 @@ import { PERSONAL_AGENDA, toAgendaItem, type AgendaItem } from '@huishouden/pwa-
 import { PERSONAL_TODOS, toTodoItem, type TodoItem } from '@huishouden/pwa-kit/todo-core';
 import { isRestricted, ROLES, type Role } from '@huishouden/pwa-kit/role-core';
 import { CALENDAR_SETTINGS, toCalendarSettings, contentHash, type CalendarSettings } from '@huishouden/pwa-kit/calendar-export';
+import { householdTimeZone, toHome, type HouseholdHome } from '@huishouden/pwa-kit/home';
 import type { Env, Fetch } from './env';
 import type { PersonRecord } from './store';
 
@@ -45,7 +46,23 @@ export interface View {
   settings: CalendarSettings;
   /** When the settings were last saved (0 when never), part of the change signal. */
   settingsAt: number;
+  /** The household's home (`households/{id}.home`), read with the household: its address and zone. */
+  home?: HouseholdHome;
 }
+
+/**
+ * The zone the person's calendar keeps: the household's home zone when it has one, else the zone
+ * their device had when they set the calendar up.
+ */
+export const zoneOf = (view: Pick<View, 'home'>, record: Pick<PersonRecord, 'timeZone'>): string => householdTimeZone(view.home, record.timeZone);
+
+/**
+ * What else the calendar depends on, for the change signal: language, zone, and the home's address
+ * (the LOCATION of things at home). Without a home it is what it was before homes, so setting none
+ * rebuilds nothing.
+ */
+export const signalExtra = (view: Pick<View, 'home'>, record: Pick<PersonRecord, 'lang' | 'timeZone'>): string =>
+  `${record.lang}|${zoneOf(view, record)}${view.home ? `|${view.home.address}` : ''}`;
 
 export interface Loaded {
   agenda: AgendaItem[];
@@ -137,6 +154,7 @@ export class Person {
     if (!household || !members.includes(email)) throw new NotMember('Not a member');
     const role = roleOf(household, email);
     const stored = settings ? { data: settings } : null;
+    const home = toHome(household.home);
     return {
       household: this.record.household,
       email,
@@ -144,6 +162,7 @@ export class Person {
       restricted: isRestricted(role),
       settings: toCalendarSettings(stored?.data),
       settingsAt: typeof stored?.data.updatedAt === 'number' ? stored.data.updatedAt : 0,
+      ...(home ? { home } : {}),
     };
   }
 

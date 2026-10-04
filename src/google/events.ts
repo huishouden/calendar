@@ -47,6 +47,7 @@ export function googleBody(e: ExportEvent, { id, householdId, timeZone }: { id: 
     status: 'confirmed',
     summary: e.title,
     description: e.description,
+    ...(e.location ? { location: e.location } : {}),
     ...when(e, timeZone),
     ...(e.series ? { recurrence: recurrenceLines(e.series, timeZone) } : {}),
     transparency: TRANSPARENT.includes(e.kind) ? 'transparent' : 'opaque',

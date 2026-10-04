@@ -34,6 +34,11 @@ events:
   for moved ones);
 - stable keys, and a hash of what each event shows.
 
+Times are on the household's clock: the home's time zone (`households/{id}.home.timeZone`, read
+with the household on every check), else the zone the person's device had when they set the
+calendar up. Things that happen at home (the Home app's events) carry the home's address as their
+location (`LOCATION` in the feed, `location` in Google).
+
 | File | Does |
 |---|---|
 | `src/index.ts` | Routes: `/feed/<secret>.ics`, `/api/*`, the cron (every minute), the queue, and `Fanout` (the entrypoint the Worker calls itself through) |

@@ -2,7 +2,7 @@ import { exportEvents, loadExportLang, type ExportEvent } from '@huishouden/pwa-
 import type { AgendaItem } from '@huishouden/pwa-kit/agenda-core';
 import { LocalClock } from '@huishouden/pwa-kit/local-clock';
 import type { Env, Fetch } from './env';
-import { NotMember, Person, signInGone, type Loaded, type View } from './person';
+import { NotMember, Person, signInGone, signalExtra, zoneOf, type Loaded, type View } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, rateLimited, reasonOf, SyncTokenGone, type BatchRequest, type GoogleEvent } from './google/api';
 import { eventId, googleBody, instanceId, overrideBody, regularBody } from './google/events';
@@ -92,7 +92,6 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
     return counts;
   }
   const google = record.google;
-  const tz = record.timeZone;
   let calendar: Calendar;
   try {
     calendar = new Calendar(await accessToken(env, google.refreshToken, fetchImpl, now), fetchImpl);
@@ -151,7 +150,9 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
     }
     throw e;
   }
-  const signal = await person.signal(view, `${record.lang}|${tz}`);
+  // The household's home zone when it has one, so "9:00" is 9:00 at home wherever the phone is.
+  const tz = zoneOf(view, record);
+  const signal = await person.signal(view, signalExtra(view, record));
   const full = !row.full_at || now - row.full_at > FULL_EVERY_MS || rows.length === 0;
   if (signal === row.signal && real.length === 0 && !full) {
     await upsertPersonRow(env, pid, { last_sync: now, last_ok: now, last_error: null, ...(nextSyncToken && nextSyncToken !== row.sync_token && changed.length > 0 ? { sync_token: nextSyncToken } : {}) }, now);
@@ -292,7 +293,7 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
 }
 
 function exportFor(loaded: Loaded, view: View, record: PersonRecord): ExportEvent[] {
-  return exportEvents({ ...loaded, me: record.email, role: view.role, lang: record.lang, timeZone: record.timeZone, settings: view.settings });
+  return exportEvents({ ...loaded, me: record.email, role: view.role, lang: record.lang, timeZone: zoneOf(view, record), settings: view.settings, home: view.home?.address });
 }
 
 export interface PlannedRequest {
