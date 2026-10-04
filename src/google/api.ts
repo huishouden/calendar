@@ -53,6 +53,7 @@ export interface GoogleEvent {
   updated?: string;
   summary?: string;
   description?: string;
+  location?: string;
   start?: GoogleDateTime;
   end?: GoogleDateTime;
   recurrence?: string[];

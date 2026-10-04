@@ -22,6 +22,8 @@ beforeEach(async () => {
 });
 
 const MIN = 60_000;
+/** An invented home in another zone than the person's device (TZ, Europe/Amsterdam). */
+const HOME = { address: '12 Example Lane, Springfield, Illinois 62701', lat: 39.7817, lng: -89.6501, timeZone: 'America/Chicago', setBy: 'alice@example.com', updatedAt: 1 };
 const call = (path: string, email: string, body?: Record<string, unknown>) => handleApi(w.env, apiRequest(path, email, body), undefined, { fetch: w.fetch, now: w.clock.now });
 
 async function connect(email = 'alice@example.com'): Promise<{ pid: string; calendarId: string }> {
@@ -114,6 +116,36 @@ describe('keeping it in step', () => {
     const quiet = await later(pid);
     expect(quiet.changes).toBe(0);
     expect(quiet.full).toBe(false);
+  });
+
+  test("the household's home: Home events get its address as location, and the calendar moves to the home's zone", async () => {
+    const { pid, calendarId } = await connect();
+    const { bins, checkup } = await ids(pid);
+    expect(w.google.cal(calendarId).events.get(bins)!.location).toBeUndefined();
+    await writeDoc(`households/${household}`, { ...(await readDoc(`households/${household}`))!, home: HOME });
+    const counts = await later(pid);
+    expect(counts.updated).toBeGreaterThan(0);
+    const cal = w.google.cal(calendarId);
+    const master = cal.events.get(bins)!;
+    expect(master.location).toBe(HOME.address);
+    expect(master.start).toEqual({ dateTime: '2031-09-04T07:00:00', timeZone: 'America/Chicago' });
+    expect(master.recurrence).toContain('EXDATE;TZID=America/Chicago:20311016T070000');
+    expect(cal.events.get(checkup)!.location).toBeUndefined();
+    // Settled: the next run writes nothing.
+    const quiet = await later(pid);
+    expect(quiet.inserted + quiet.updated + quiet.deleted).toBe(0);
+    // The home removed: the address goes from the event again.
+    const { home: _h, ...without } = (await readDoc(`households/${household}`))!;
+    await writeDoc(`households/${household}`, without);
+    await later(pid);
+    expect(w.google.cal(calendarId).events.get(bins)!.location).toBeUndefined();
+    expect(w.google.cal(calendarId).events.get(bins)!.start).toEqual({ dateTime: '2031-09-04T07:00:00', timeZone: TZ });
+  });
+
+  test("connecting in a household with a home makes the calendar in the home's zone", async () => {
+    await writeDoc(`households/${household}`, { ...(await readDoc(`households/${household}`))!, home: HOME });
+    const { calendarId } = await connect('bob@example.com');
+    expect(w.google.cal(calendarId).timeZone).toBe('America/Chicago');
   });
 
   test('an item changed in the app: only its event is rewritten', async () => {
