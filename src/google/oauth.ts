@@ -43,9 +43,11 @@ async function tokenCall(fetchImpl: Fetch, body: Record<string, string>): Promis
   }
   const answer = (await res.json().catch(() => ({}))) as TokenAnswer;
   if (!res.ok || !answer.access_token) {
-    if (answer.error === 'invalid_grant') throw new GoogleAuthError('revoked', 'Google access was removed');
-    if (res.status >= 400 && res.status < 500) throw new GoogleAuthError('denied', answer.error ?? `Google ${res.status}`);
-    throw new GoogleAuthError('unavailable', `Google ${res.status}`);
+    // Google's own error name and description, for the log (never a token).
+    const said = `${answer.error ?? res.status}${answer.error_description ? `: ${answer.error_description}` : ''}`.slice(0, 120);
+    if (answer.error === 'invalid_grant') throw new GoogleAuthError('revoked', `Google access was removed (${said})`);
+    if (res.status >= 400 && res.status < 500) throw new GoogleAuthError('denied', said);
+    throw new GoogleAuthError('unavailable', `Google ${said}`);
   }
   return answer;
 }

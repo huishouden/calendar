@@ -6,7 +6,7 @@ import type { Env, Fetch } from './env';
 import { feedUrl } from './feed';
 import { log } from './log';
 import { authOptions, overQuota } from './person';
-import { Calendar } from './google/api';
+import { Calendar, CalendarApiError } from './google/api';
 import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, revokeGoogle } from './google/oauth';
 import { deletePerson, deletePersonRows, loadPerson, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
 import { syncPerson } from './sync';
@@ -32,9 +32,20 @@ class HttpError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
+    /** For the log only: what Google or Firebase said (an error name, never a token or an email). */
+    readonly detail?: string,
   ) {
     super(code);
   }
+}
+
+/** A failure's cause for the log: the error's kind and the service's own error name or status. No values. */
+function causeOf(e: unknown): Record<string, string | number> {
+  if (e instanceof CalendarApiError) return { error: 'calendar', googleStatus: e.status, reason: e.message.replace(/^\[\d+\] /, '').slice(0, 80) };
+  if (e instanceof GoogleAuthError) return { error: `google-${e.kind}`, reason: e.message.slice(0, 80) };
+  if (e instanceof FirebaseAuthError) return { error: `firebase-${e.kind}` };
+  if (e instanceof FirestoreError) return { error: 'firestore', reason: e.code };
+  return { error: e instanceof Error ? e.name : typeof e };
 }
 
 function cors(env: Env, request: Request): Record<string, string> {
@@ -102,8 +113,8 @@ async function personFrom(env: Env, who: Caller, b: Record<string, unknown>, fet
     let checked;
     try {
       checked = await exchangeRefreshToken(authOptions(env, fetchImpl), b.refreshToken);
-    } catch {
-      throw new HttpError(400, 'refresh-token');
+    } catch (e) {
+      throw new HttpError(400, 'refresh-token', e instanceof FirebaseAuthError ? `firebase-${e.kind}: ${e.message.slice(0, 60)}` : 'error');
     }
     if (checked.uid !== who.uid) throw new HttpError(400, 'refresh-token');
     refreshToken = b.refreshToken;
@@ -193,7 +204,7 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
         try {
           granted = await exchangeCode(env, b.code, fetchImpl, now);
         } catch (e) {
-          if (e instanceof GoogleAuthError) throw new HttpError(e.kind === 'config' ? 501 : e.kind === 'unavailable' ? 503 : 400, `google-${e.kind}`);
+          if (e instanceof GoogleAuthError) throw new HttpError(e.kind === 'config' ? 501 : e.kind === 'unavailable' ? 503 : 400, `google-${e.kind}`, e.message.slice(0, 80));
           throw e;
         }
         const calendar = new Calendar(granted.accessToken, fetchImpl);
@@ -252,14 +263,14 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
     }
   } catch (e) {
     if (e instanceof HttpError) {
-      log('api', { route: url.pathname, ok: false, status: e.status, code: e.code });
+      log('api', { route: url.pathname, ok: false, status: e.status, code: e.code, ...(e.detail ? { detail: e.detail } : {}) });
       return json(e.status, { error: e.code }, headers);
     }
     if (overQuota(e)) {
       log('api', { route: url.pathname, ok: false, status: 503, code: 'firestore-quota' });
       return json(503, { error: 'firestore-quota' }, { ...headers, 'Retry-After': '3600' });
     }
-    log('api', { route: url.pathname, ok: false, status: 500 });
+    log('api', { route: url.pathname, ok: false, status: 500, ...causeOf(e) });
     return json(500, { error: 'server' }, headers);
   }
 }
