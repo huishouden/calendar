@@ -14,7 +14,7 @@
     "test:emulator": "firebase emulators:exec --only firestore --project demo-huishouden-calendar \"bun test\""
   },
   "dependencies": {
-    "@huishouden/pwa-kit": "github:huishouden/pwa-kit#8ae57ea"
+    "@huishouden/pwa-kit": "github:huishouden/pwa-kit#v0.67.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261002.1",
