@@ -23,8 +23,11 @@ import { ANSWERED, markSeen, newImportId, putReview, type InboxConfig, type Inbo
  *   transactions anyone deleted, statement rows, and alerts the app's own Check email wrote.
  */
 
-/** 1: the first checker. 2: readAlert (purchase rules, review list, transaction dates). */
-export const PARSER_VERSION = 2;
+/**
+ * 1: the first checker. 2: readAlert (purchase rules, review list, transaction dates). 3: investing
+ * and bank account notices, HTML in text parts, Visa Purchase Alerts' body (kit 0.81.0).
+ */
+export const PARSER_VERSION = 3;
 /** Emails re-read per unit: each is a Gmail request and a parse, within the free plan's CPU time. */
 export const RECHECK_PER_UNIT = 3;
 
@@ -67,6 +70,10 @@ export async function existingFrom(person: Person, messages: MailMessage[], time
   const from = dayOf(Math.min(...messages.map((m) => m.date)) - 4 * 86_400_000, timeZone);
   return (await person.db.query(person.base, 'spendingTransactions', { where: [{ field: 'date', op: 'GREATER_THAN_OR_EQUAL', value: from }] })).map(toExisting);
 }
+
+/** The last import's "need review": what is still on the list from it. */
+export const recountReview = (env: Env, inbox: string): D1PreparedStatement =>
+  env.DB.prepare('UPDATE inboxes SET import_review = (SELECT COUNT(*) FROM inbox_review WHERE inbox = ?1 AND import_id = inboxes.import_id) WHERE id = ?1').bind(inbox);
 
 export interface RecheckTotals {
   read: number;
@@ -197,6 +204,7 @@ export async function recheckUnit(env: Env, row: InboxRow, record: InboxRecord, 
           ).bind(importId, now, starting ? 1 : 0, totals.added, totals.review, row.id),
         ]
       : []),
+    recountReview(env, row.id),
   ]);
   return { more: true, totals };
 }

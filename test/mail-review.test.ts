@@ -235,6 +235,30 @@ describe('re-reading past imports', () => {
   });
 });
 
+describe('a newer parser takes emails off the review list', () => {
+  test('account notices put on the list by an older parser leave it, and the last import says so', async () => {
+    const t = w.clock.now - 3 * 3_600_000;
+    const order = w.gmail.deliver('alerts', { from: 'Example Invest <notifications@invest.example.com>', subject: 'Option order executed', text: '<div style="color:#333">Your order to buy 1 contract of EXMPL was executed at an average price of $1.15 per contract.</div><table width="100%"><tr><td>Total cost: $115.00</td></tr></table>', at: t });
+    const vague = w.gmail.deliver('alerts', { from: BANK, subject: 'Card purchase', text: 'A charge was made on your card ending in 1111 for $40.03.', at: t + MIN });
+    const id = await connect();
+    await drain(w);
+    // As the older parser left it: both on the list, from one import.
+    const { putReview } = await import('../src/mail/store');
+    const importId = (await status()).inboxes[0].lastImport!.id;
+    await w.env.DB.batch([await putReview(w.env, id, { msg: order, subject: 'Option order executed', sent: t, date: '2031-10-01', amount: 115, reason: 'no-merchant' }, importId, w.clock.now)]);
+    await w.env.DB.prepare(`UPDATE inbox_seen SET parsed = ${PARSER_VERSION - 1}, state = 'review', import_id = ? WHERE msg = ?`).bind(importId, order).run();
+    await w.env.DB.prepare(`UPDATE inboxes SET rechecked = ${PARSER_VERSION - 1}, import_review = 2`).run();
+    expect((await status()).inboxes[0].review).toBe(2);
+    await tick();
+    await tick();
+    const s = (await status()).inboxes[0];
+    expect(s.review).toBe(1);
+    expect(s.lastImport?.review).toBe(1);
+    const list = (await (await call(`/api/mail/review?household=${household}&inbox=${id}`, 'bob@example.com')).json()) as { items: ReviewItem[] };
+    expect(list.items.map((i) => i.msg)).toEqual([vague]);
+  });
+});
+
 describe('shapes', () => {
   test('words outside the alert vocabulary, numbers and amounts are masked', () => {
     expect(maskLine('You made a $45.76 transaction with PUBLIX STORE #228 on Oct 2, 2031')).toBe('You made a $# transaction with X ## on Oct #, #');

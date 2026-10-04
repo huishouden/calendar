@@ -12,7 +12,7 @@ import { actingAs, inboxDoc } from './inbox';
 import { MAIL_EVERY_MIN } from './check';
 import { deleteInbox, householdInboxes, inboxIdOf, inboxRow, lastMailTick, listReview, openRecord, putInbox, reviewCount, STOPPED, type InboxRecord, type InboxRow, type ReviewItem } from './store';
 import { markMailWork } from './work';
-import { PARSER_VERSION } from './recheck';
+import { PARSER_VERSION, recountReview } from './recheck';
 
 /**
  * Spending's calls about alert inboxes, as the signed-in member (admins and members only: helpers
@@ -247,7 +247,7 @@ export async function answerReview(env: Env, who: MailCaller, b: Record<string, 
   await env.DB.batch([
     env.DB.prepare('DELETE FROM inbox_review WHERE inbox = ? AND msg = ?').bind(id, b.msg),
     env.DB.prepare('UPDATE inbox_seen SET state = ? WHERE inbox = ? AND msg = ?').bind(b.answer === 'entered' ? 'entered' : 'dismissed', id, b.msg),
-    env.DB.prepare('UPDATE inboxes SET import_review = MAX(0, import_review - 1) WHERE id = ? AND import_id = (SELECT import_id FROM inbox_seen WHERE inbox = ? AND msg = ?)').bind(id, id, b.msg),
+    recountReview(env, id),
   ]);
   log('api', { route: 'mail-review', ok: true, answer: b.answer, at: now });
   return { items: await listReview(env, id) };
