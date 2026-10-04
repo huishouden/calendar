@@ -16,11 +16,14 @@ export interface FakeMail {
   /** ms since epoch. */
   at: number;
   labels?: string[];
+  /** Sent to a list: a List-Unsubscribe header. */
+  bulk?: boolean;
 }
 
 interface Stored extends FakeMail {
   id: string;
   historyId: number;
+  deleted?: boolean;
 }
 
 interface Box {
@@ -59,6 +62,12 @@ export class FakeGmail {
     const id = `m${(++this.seq).toString(16).padStart(6, '0')}`;
     b.messages.push({ ...mail, id, historyId: b.historyId });
     return id;
+  }
+
+  /** The member deletes a message: reading it is a 404. */
+  remove(name: string, id: string): void {
+    const m = this.box(name).messages.find((x) => x.id === id);
+    if (m) m.deleted = true;
   }
 
   /** Gmail forgets history older than now (as after a week without a check). */
@@ -106,7 +115,7 @@ export class FakeGmail {
     const one = /^messages\/(.+)$/.exec(path);
     if (one) {
       this.calls.push(`get ${b.address}`);
-      const m = b.messages.find((x) => x.id === decodeURIComponent(one[1]));
+      const m = b.messages.find((x) => x.id === decodeURIComponent(one[1]) && !x.deleted);
       if (!m) return json(404, { error: { status: 'NOT_FOUND' } });
       const parts = [
         ...(m.text !== undefined ? [{ mimeType: 'text/plain', body: { data: encodeBase64Url(m.text), size: m.text.length } }] : []),
@@ -117,7 +126,7 @@ export class FakeGmail {
         threadId: m.id,
         labelIds: m.labels ?? ['INBOX'],
         internalDate: String(m.at),
-        payload: { mimeType: 'multipart/alternative', headers: [{ name: 'From', value: m.from }, { name: 'Subject', value: m.subject }], parts },
+        payload: { mimeType: 'multipart/alternative', headers: [{ name: 'From', value: m.from }, { name: 'Subject', value: m.subject }, ...(m.bulk ? [{ name: 'List-Unsubscribe', value: '<mailto:unsubscribe@example.com>' }] : [])], parts },
       });
     }
     return json(404, { error: { status: 'NOT_FOUND' } });
