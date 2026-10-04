@@ -58,7 +58,7 @@ jobs:
   # until then. Staging first, then production. Worker secrets stay in Cloudflare.
   deploy:
     needs: [leak-scan, build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Cloudflare token present?
