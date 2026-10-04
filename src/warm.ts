@@ -21,7 +21,7 @@ export function warm(): void {
         const events = exportEvents({ agenda, todos: [], me: 'warm@invalid', role: 'admin', lang, timeZone: 'Europe/Amsterdam', settings: DEFAULT_CALENDAR_SETTINGS });
         exportIcs(events, { householdId: 'warm', timeZone: 'Europe/Amsterdam', lang, now: day });
         for (const e of events) googleBody(e, { id: 'warm', householdId: 'warm', timeZone: 'Europe/Amsterdam' });
-      });
+      }).catch(() => undefined);
     }
   } catch {
     // Warming is only ever an optimisation.
