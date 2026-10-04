@@ -143,9 +143,15 @@ hold titles, emails, households or tokens.
   A busy run writes at most 200 events per person, and the rest go next run.
 - **Firestore's free tier**: a check costs about 6 reads per person per run when nothing changed,
   about 1,700 a day each. A rebuild reads the person's agenda, a few hundred documents.
-- **CPU**: the free plan allows 10 ms of CPU per request. A feed of 400 events takes about 2 ms
-  warm and 17 ms on a cold start in Bun. A cold start can go over; Cloudflare then answers with an
-  error, and the calendar app tries again later.
+- **CPU**: measured on staging with about 50 events:
+  - a feed rebuild takes 28 to 53 ms of CPU time;
+  - a feed served from the cache, 8 ms;
+  - a portal API call, 3 to 21 ms.
+
+  Cloudflare reported each of these as `ok`. If the account's plan enforces a 10 ms per-request
+  limit, a rebuild could be refused with error 1102. The calendar app would then retry later and
+  get the cached feed once one exists. Most of the cost is the cold start: the zone data for the
+  VTIMEZONE and the language catalogue load.
 - **Ahead of the window**: apps publish 180 days ahead (Home's regular events 60). A repeating event
   carries on past that by its schedule. A skip or move further ahead shows once it is within the
   app's window.
@@ -227,8 +233,11 @@ bun run deploy              # production
 bunx wrangler tail          # one line of counts per run and per request
 ```
 
-CI deploys on every push to `main` once the repo has `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` secrets (an "Edit Cloudflare Workers" token, the same as huishouden/notify).
+CI deploys staging, then production, on every push to `main` once the organisation secrets
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` reach this repo; until then the deploy job is
+skipped with a notice. The Worker's URL is `https://huishouden-calendar.<account>.workers.dev`
+(`-staging` for staging). It takes its own origin from each request, so feed links follow the
+account's workers.dev subdomain.
 
 ## Development
 
