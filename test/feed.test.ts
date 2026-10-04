@@ -44,6 +44,8 @@ async function get(secret: string, headers: Record<string, string> = {}, method 
   let inSelf = 0;
   w.env.SELF = {
     check: async (pids) => (checksAsked.push(pids), { checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, deferred: [], paused: false }),
+    mail: self.mail,
+    mailWork: self.mailWork,
     work: async (pid) => {
       inSelf++;
       try {

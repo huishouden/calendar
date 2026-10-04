@@ -16,8 +16,8 @@ export interface Env {
   ALLOWED_ORIGINS: string;
   /** The Google calendar's name: "Huishouden". */
   CALENDAR_NAME?: string;
-  /** The work queue (src/work.ts): one message per person with work. Optional: the cron runs work without it. */
-  WORK?: Queue<{ pid: string }>;
+  /** The work queue (src/work.ts, src/mail/work.ts): one message per person or alert inbox with work. Optional: the cron runs work without it. */
+  WORK?: Queue<{ pid: string } | { inbox: string }>;
   /** This Worker's own `Fanout` entrypoint (src/index.ts): each call is its own invocation, with its own CPU time and subrequests. */
   SELF?: FanoutRpc;
   /**
@@ -42,4 +42,7 @@ export const globalFetch: Fetch = (url, init) => fetch(url, init);
 export interface FanoutRpc {
   check(pids: string[]): Promise<import('./check').CheckTotals>;
   work(pid: string): Promise<import('./work').WorkOutcome>;
+  /** Spending's alert inboxes: a few checked (src/mail/check.ts), and one unit of an inbox's import (src/mail/work.ts). */
+  mail(ids: string[]): Promise<import('./mail/check').MailTotals>;
+  mailWork(id: string): Promise<import('./work').WorkOutcome>;
 }
