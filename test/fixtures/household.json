@@ -1,0 +1,32 @@
+{
+  "comment": "One invented household. Times are ISO strings; the test turns them into ms. Edits are as the apps publish them.",
+  "household": "h1",
+  "timeZone": "Europe/Amsterdam",
+  "docs": {
+    "households/h1": { "name": "Home", "members": ["alice@example.com", "bob@example.com", "cora@example.com", "helen@example.com", "kim@example.com"], "joined": ["alice@example.com", "bob@example.com", "cora@example.com", "helen@example.com", "kim@example.com"], "roles": { "helen@example.com": "helper", "kim@example.com": "kid" }, "createdAt": 1 },
+    "households/h1/homeEvents/bins": { "title": "Garbage pickup", "kind": "trash", "rule": { "freq": "week", "every": 1, "start": "2031-09-04" }, "time": "07:00", "exceptions": { "2031-10-16": { "skipped": true } }, "createdAt": 1, "by": "alice@example.com" },
+    "households/h1/babyAppointments/a1": { "title": "Checkup", "at": "2031-10-07T10:30:00+02:00", "private": false, "createdAt": 1, "by": "bob@example.com" },
+    "households/h1/agenda/home_event_bins_1": { "app": "home", "ref": "event:bins", "kind": "other", "title": "Garbage pickup", "start": "2031-10-02T07:00:00+02:00", "end": "2031-10-02T07:30:00+02:00", "allDay": false, "detail": "Every Thursday", "url": "https://huishouden-piekstra.web.app/home/#regular", "private": false, "series": "$series:2031-10-02", "edit": "$binsEdit", "texts": { "es": { "title": "Recogida de basura" } }, "updatedAt": "2031-09-30T12:00:00Z", "by": "alice@example.com" },
+    "households/h1/agenda/home_event_bins_2": { "app": "home", "ref": "event:bins", "kind": "other", "title": "Garbage pickup", "start": "2031-10-09T07:00:00+02:00", "end": "2031-10-09T07:30:00+02:00", "allDay": false, "detail": "Every Thursday", "url": "https://huishouden-piekstra.web.app/home/#regular", "private": false, "series": "$series:2031-10-09", "edit": "$binsEdit", "updatedAt": "2031-09-30T12:00:00Z", "by": "alice@example.com" },
+    "households/h1/agenda/home_event_bins_4": { "app": "home", "ref": "event:bins", "kind": "other", "title": "Garbage pickup", "start": "2031-10-23T07:00:00+02:00", "end": "2031-10-23T07:30:00+02:00", "allDay": false, "detail": "Every Thursday", "url": "https://huishouden-piekstra.web.app/home/#regular", "private": false, "series": "$series:2031-10-23", "edit": "$binsEdit", "updatedAt": "2031-09-30T12:00:00Z", "by": "alice@example.com" },
+    "households/h1/agenda/home_event_bins_5": { "app": "home", "ref": "event:bins", "kind": "other", "title": "Garbage pickup", "start": "2031-10-30T07:00:00+01:00", "end": "2031-10-30T07:30:00+01:00", "allDay": false, "detail": "Every Thursday", "url": "https://huishouden-piekstra.web.app/home/#regular", "private": false, "series": "$series:2031-10-30", "edit": "$binsEdit", "updatedAt": "2031-09-30T12:00:00Z", "by": "alice@example.com" },
+    "households/h1/agenda/baby_appointment_a1": { "app": "baby", "ref": "appointment:a1", "kind": "appointment", "title": "Checkup", "start": "2031-10-07T10:30:00+02:00", "allDay": false, "detail": "Clinic", "url": "https://huishouden-piekstra.web.app/baby/", "private": false,
+      "edit": {
+        "reschedule": { "ops": [{ "col": "babyAppointments", "id": "a1", "data": { "at": "$start", "updatedAt": "$now" }, "merge": true }], "roles": ["admin", "member", "helper"] },
+        "rename": { "ops": [{ "col": "babyAppointments", "id": "a1", "data": { "title": "$title", "updatedAt": "$now" }, "merge": true }], "roles": ["admin", "member"] },
+        "notes": { "ops": [{ "col": "babyAppointments", "id": "a1", "data": { "notes": "$notes", "updatedAt": "$now" }, "merge": true }], "roles": ["admin", "member"] },
+        "cancel": { "ops": [{ "col": "babyAppointments", "id": "a1", "data": null }], "roles": ["admin", "member"] }
+      },
+      "updatedAt": "2031-09-30T12:00:00Z", "by": "bob@example.com" },
+    "households/h1/agenda/bills_bill_power": { "app": "bills", "ref": "bill:power", "kind": "bill", "title": "Power bill", "start": "2031-10-20T00:00:00+02:00", "allDay": true, "detail": "€84.10", "url": "https://huishouden-piekstra.web.app/bills/", "status": "upcoming", "private": true, "updatedAt": "2031-09-30T12:00:00Z", "by": "alice@example.com" },
+    "households/h1/personalAgenda/health_dose": { "app": "health", "ref": "dose:nan:2031-10-05T08:00", "kind": "medicine", "title": "Medicine for Nan", "start": "2031-10-05T08:00:00+02:00", "allDay": false, "detail": "Amoxicillin 250 mg", "who": "Nan", "url": "https://huishouden-piekstra.web.app/health/", "status": "upcoming", "private": true, "audience": ["alice@example.com", "cora@example.com"], "updatedAt": "2031-09-30T12:00:00Z", "by": "cora@example.com" },
+    "households/h1/todos/tasks:item:paint": { "app": "tasks", "ref": "item:paint", "title": "Buy paint", "createdAt": 1, "due": "2031-10-12T00:00:00+02:00", "url": "https://huishouden-piekstra.web.app/tasks/", "status": "open", "private": false, "updatedAt": "2031-09-30T12:00:00Z", "by": "bob@example.com" }
+  },
+  "series": { "rule": { "freq": "week", "every": 1, "start": "2031-09-04" }, "time": "07:00", "minutes": 30, "through": "2031-10-30" },
+  "binsEdit": {
+    "reschedule": { "ops": [{ "col": "homeEvents", "id": "bins", "data": { "exceptions": { "$original": { "moved": { "date": "$date", "time": "$time" } } }, "updatedAt": "$now" }, "merge": true }], "roles": ["admin", "member"] },
+    "retime": { "ops": [{ "col": "homeEvents", "id": "bins", "data": { "time": "$time", "updatedAt": "$now" }, "merge": true }], "roles": ["admin", "member"] },
+    "rename": { "ops": [{ "col": "homeEvents", "id": "bins", "data": { "title": "$title", "updatedAt": "$now" }, "merge": true }], "roles": ["admin", "member"] },
+    "skip": { "ops": [{ "col": "homeEvents", "id": "bins", "data": { "exceptions": { "$original": { "skipped": true } }, "updatedAt": "$now" }, "merge": true }], "roles": ["admin", "member"] }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "huishouden-calendar",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "lint": "tsc --noEmit && tsc --noEmit -p test",
+    "test": "bun test",
+    "seal-key": "bun scripts/seal-key.ts",
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler d1 migrations apply huishouden-calendar --remote && wrangler deploy",
+    "deploy:staging": "wrangler d1 migrations apply huishouden-calendar-staging --remote --env staging && wrangler deploy --env staging",
+    "prepare": "git config core.hooksPath .githooks || true",
+    "test:emulator": "firebase emulators:exec --only firestore --project demo-huishouden-calendar \"bun test\""
+  },
+  "dependencies": {
+    "@huishouden/pwa-kit": "github:huishouden/pwa-kit#8ae57ea"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261002.1",
+    "@types/bun": "latest",
+    "ical.js": "2.2.1",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.147.0",
+    "firebase-tools": "^15.32.1"
+  }
+}

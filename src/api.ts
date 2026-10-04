@@ -1,0 +1,261 @@
+import { exchangeRefreshToken, FirebaseAuthError, verifyIdToken } from '@huishouden/pwa-kit/firebase-auth-rest';
+import { FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
+import { isLang, type Lang } from '@huishouden/pwa-kit/i18n';
+import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
+import type { Env, Fetch } from './env';
+import { feedUrl } from './feed';
+import { log } from './log';
+import { authOptions } from './person';
+import { Calendar } from './google/api';
+import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, revokeGoogle } from './google/oauth';
+import { deletePerson, deletePersonRows, loadPerson, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
+import { syncPerson } from './sync';
+
+/**
+ * What the portal's Calendar page calls, as the signed-in person (their Firebase ID token in
+ * `Authorization`). CORS allows only the suite's site. Every answer is about the caller only.
+ *
+ * - `GET  /api/status?household=`: the feed's URL, and Google's state (account, last sync, errors).
+ * - `POST /api/feed`: set up the feed (or refresh what it acts with). Body: household, the person's
+ *   Firebase refresh token, language, time zone.
+ * - `POST /api/feed/rotate`: a new secret URL; the old one stops working.
+ * - `POST /api/feed/revoke`: no feed.
+ * - `POST /api/google/connect`: Google's one-time code from the portal's popup; creates the
+ *   "Huishouden" calendar and syncs it.
+ * - `POST /api/google/sync`: sync now.
+ * - `POST /api/google/disconnect`: stop syncing; `deleteCalendar: true` also deletes the calendar.
+ */
+
+export const GOOGLE_COLOUR = '#2d6a4f';
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+  ) {
+    super(code);
+  }
+}
+
+function cors(env: Env, request: Request): Record<string, string> {
+  const origin = request.headers.get('Origin') ?? '';
+  const allowed = env.ALLOWED_ORIGINS.split(/\s+/).filter(Boolean);
+  if (!allowed.includes(origin)) return {};
+  return { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Max-Age': '600', Vary: 'Origin' };
+}
+
+const json = (status: number, body: unknown, headers: Record<string, string>) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers } });
+
+interface Caller {
+  uid: string;
+  email: string;
+  household: string;
+  pid: string;
+  idToken: string;
+}
+
+const HOUSEHOLD = /^[A-Za-z0-9_-]{1,128}$/;
+
+async function caller(env: Env, request: Request, household: string | null, fetchImpl: Fetch | undefined, firestoreUrl?: string): Promise<Caller> {
+  const idToken = /^Bearer (.+)$/.exec(request.headers.get('Authorization') ?? '')?.[1];
+  if (!idToken) throw new HttpError(401, 'sign-in');
+  if (!household || !HOUSEHOLD.test(household)) throw new HttpError(400, 'household');
+  let who;
+  try {
+    who = await verifyIdToken(authOptions(env, fetchImpl), idToken);
+  } catch (e) {
+    if (e instanceof FirebaseAuthError && e.kind === 'unavailable') throw new HttpError(503, 'unavailable');
+    throw new HttpError(401, 'sign-in');
+  }
+  // A member reads their household; anyone else is refused by the rules.
+  const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, ...(fetchImpl ? { fetch: fetchImpl } : {}), ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}) });
+  const doc = await db.get(`households/${household}`).catch(() => null);
+  const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
+  if (!members.includes(who.email)) throw new HttpError(403, 'not-member');
+  return { ...who, household, pid: await personId(household, who.email), idToken };
+}
+
+async function body(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const b = (await request.json()) as unknown;
+    return b && typeof b === 'object' ? (b as Record<string, unknown>) : {};
+  } catch {
+    throw new HttpError(400, 'body');
+  }
+}
+
+/** The person's record, made or refreshed from what the portal sent: their refresh token (checked to be theirs), language and zone. */
+async function personFrom(env: Env, who: Caller, b: Record<string, unknown>, fetchImpl?: Fetch): Promise<PersonRecord> {
+  const existing = await loadPerson(env, who.pid);
+  const lang: Lang = isLang(b.lang) ? b.lang : (existing?.lang ?? 'en');
+  const timeZone = typeof b.timeZone === 'string' && isTimeZone(b.timeZone) ? b.timeZone : (existing?.timeZone ?? 'UTC');
+  let refreshToken = existing?.refreshToken;
+  if (typeof b.refreshToken === 'string' && b.refreshToken.length >= 20 && b.refreshToken.length <= 4096) {
+    let checked;
+    try {
+      checked = await exchangeRefreshToken(authOptions(env, fetchImpl), b.refreshToken);
+    } catch {
+      throw new HttpError(400, 'refresh-token');
+    }
+    if (checked.uid !== who.uid) throw new HttpError(400, 'refresh-token');
+    refreshToken = b.refreshToken;
+  }
+  if (!refreshToken) throw new HttpError(400, 'refresh-token');
+  return { ...(existing ?? {}), household: who.household, email: who.email, uid: who.uid, refreshToken, lang, timeZone, signedOut: false } as PersonRecord;
+}
+
+function origin(request: Request): string {
+  return new URL(request.url).origin;
+}
+
+async function status(env: Env, request: Request, who: Caller) {
+  const record = await loadPerson(env, who.pid);
+  const row = await personRow(env, who.pid);
+  const base = origin(request);
+  const feed = record?.feed ? feedUrl(base, record.feed.secret) : null;
+  return {
+    feed: feed ? { url: feed, webcal: feed.replace(/^https?:/, 'webcal:'), createdAt: record!.feed!.createdAt } : null,
+    signedOut: record?.signedOut === true,
+    googleAvailable: !!env.GOOGLE_CLIENT_SECRET,
+    google: record?.google
+      ? {
+          account: record.google.account,
+          connectedAt: record.google.connectedAt,
+          lastSync: row?.last_sync ?? null,
+          lastOk: row?.last_ok ?? null,
+          error: row?.last_error ?? null,
+          notice: row?.notice ?? null,
+          counts: row?.counts ? (JSON.parse(row.counts) as Record<string, number>) : null,
+        }
+      : null,
+    lastError: !record?.google && row?.last_error ? row.last_error : null,
+  };
+}
+
+export async function handleApi(env: Env, request: Request, ctx: ExecutionContext | undefined, deps: { fetch?: Fetch; now?: number; firestoreUrl?: string } = {}): Promise<Response> {
+  const headers = cors(env, request);
+  if (request.method === 'OPTIONS') return new Response(null, { status: headers['Access-Control-Allow-Origin'] ? 204 : 403, headers });
+  const url = new URL(request.url);
+  const now = deps.now ?? Date.now();
+  const fetchImpl = deps.fetch;
+  try {
+    const b = request.method === 'POST' ? await body(request) : {};
+    const household = request.method === 'GET' ? url.searchParams.get('household') : typeof b.household === 'string' ? b.household : null;
+    const who = await caller(env, request, household, fetchImpl, deps.firestoreUrl);
+    const route = `${request.method} ${url.pathname}`;
+    switch (route) {
+      case 'GET /api/status':
+        return json(200, await status(env, request, who), headers);
+      case 'POST /api/feed': {
+        const record = await personFrom(env, who, b, fetchImpl);
+        if (!record.feed) record.feed = { secret: await newFeed(env, who.pid), createdAt: now };
+        await savePerson(env, who.pid, record);
+        await upsertPersonRow(env, who.pid, { feed: 1 }, now);
+        log('api', { route: 'feed', ok: true });
+        return json(200, await status(env, request, who), headers);
+      }
+      case 'POST /api/feed/rotate': {
+        const record = await personFrom(env, who, b, fetchImpl);
+        if (record.feed) await revokeFeed(env, record.feed.secret);
+        record.feed = { secret: await newFeed(env, who.pid), createdAt: now };
+        await savePerson(env, who.pid, record);
+        await env.DB.prepare('DELETE FROM feeds WHERE pid = ?').bind(who.pid).run();
+        await upsertPersonRow(env, who.pid, { feed: 1 }, now);
+        log('api', { route: 'rotate', ok: true });
+        return json(200, await status(env, request, who), headers);
+      }
+      case 'POST /api/feed/revoke': {
+        const record = await loadPerson(env, who.pid);
+        if (record?.feed) await revokeFeed(env, record.feed.secret);
+        if (record?.google) {
+          await savePerson(env, who.pid, { ...record, feed: undefined });
+          await upsertPersonRow(env, who.pid, { feed: 0 }, now);
+          await env.DB.prepare('DELETE FROM feeds WHERE pid = ?').bind(who.pid).run();
+        } else {
+          await deletePerson(env, who.pid);
+          await deletePersonRows(env, who.pid);
+        }
+        log('api', { route: 'revoke', ok: true });
+        return json(200, await status(env, request, who), headers);
+      }
+      case 'POST /api/google/connect': {
+        if (typeof b.code !== 'string' || b.code.length > 2048) throw new HttpError(400, 'code');
+        const record = await personFrom(env, who, b, fetchImpl);
+        let granted;
+        try {
+          granted = await exchangeCode(env, b.code, fetchImpl, now);
+        } catch (e) {
+          if (e instanceof GoogleAuthError) throw new HttpError(e.kind === 'config' ? 501 : e.kind === 'unavailable' ? 503 : 400, `google-${e.kind}`);
+          throw e;
+        }
+        const calendar = new Calendar(granted.accessToken, fetchImpl);
+        // Connecting again keeps the calendar it made before, when it is still there.
+        let calendarId = record.google?.calendarId;
+        if (!calendarId || !(await calendar.calendarExists(calendarId).catch(() => false))) {
+          calendarId = await calendar.createCalendar(env.CALENDAR_NAME ?? 'Huishouden', descriptionFor(record.lang), record.timeZone);
+          await calendar.colour(calendarId, GOOGLE_COLOUR);
+          await env.DB.prepare('DELETE FROM events WHERE pid = ?').bind(who.pid).run();
+          await upsertPersonRow(env, who.pid, { sync_token: null, signal: null, full_at: null }, now);
+        }
+        if (record.google && record.google.refreshToken !== granted.refreshToken) await revokeGoogle(record.google.refreshToken, fetchImpl);
+        record.google = { refreshToken: granted.refreshToken, calendarId, account: granted.account, scope: CALENDAR_SCOPE, connectedAt: now };
+        await savePerson(env, who.pid, record);
+        await upsertPersonRow(env, who.pid, { google: 1, last_error: null, notice: null }, now);
+        log('api', { route: 'google-connect', ok: true });
+        const first = syncPerson(env, who.pid, deps).catch(() => undefined);
+        if (ctx) ctx.waitUntil(first);
+        else await first;
+        return json(200, await status(env, request, who), headers);
+      }
+      case 'POST /api/google/sync': {
+        const record = await loadPerson(env, who.pid);
+        if (!record?.google) throw new HttpError(409, 'not-connected');
+        await syncPerson(env, who.pid, deps);
+        return json(200, await status(env, request, who), headers);
+      }
+      case 'POST /api/google/disconnect': {
+        const record = await loadPerson(env, who.pid);
+        if (record?.google) {
+          if (b.deleteCalendar === true) {
+            try {
+              const calendar = new Calendar(await accessToken(env, record.google.refreshToken, fetchImpl, now), fetchImpl);
+              await calendar.deleteCalendar(record.google.calendarId);
+            } catch {
+              // Access already removed in Google: there is nothing more the Worker can delete.
+            }
+          }
+          await revokeGoogle(record.google.refreshToken, fetchImpl);
+          const rest = { ...record, google: undefined };
+          if (rest.feed) await savePerson(env, who.pid, rest);
+          else await deletePerson(env, who.pid);
+        }
+        await env.DB.prepare('DELETE FROM events WHERE pid = ?').bind(who.pid).run();
+        if (record?.feed) await upsertPersonRow(env, who.pid, { google: 0, sync_token: null, signal: null, full_at: null, last_error: null, notice: null, counts: null }, now);
+        else await deletePersonRows(env, who.pid);
+        log('api', { route: 'google-disconnect', ok: true, deleted: b.deleteCalendar === true });
+        return json(200, await status(env, request, who), headers);
+      }
+      case 'POST /api/notice/clear': {
+        await upsertPersonRow(env, who.pid, { notice: null }, now);
+        return json(200, await status(env, request, who), headers);
+      }
+      default:
+        throw new HttpError(404, 'route');
+    }
+  } catch (e) {
+    if (e instanceof HttpError) {
+      log('api', { route: url.pathname, ok: false, status: e.status, code: e.code });
+      return json(e.status, { error: e.code }, headers);
+    }
+    log('api', { route: url.pathname, ok: false, status: 500 });
+    return json(500, { error: 'server' }, headers);
+  }
+}
+
+const DESCRIPTIONS: Record<Lang, string> = {
+  en: 'From Huishouden: appointments, regular events and things to do at home. Changes you make here go back to Huishouden.',
+  es: 'De Huishouden: citas, eventos habituales y cosas por hacer en casa. Los cambios que hagas aquí vuelven a Huishouden.',
+  nl: 'Uit Huishouden: afspraken, vaste gebeurtenissen en dingen die thuis moeten gebeuren. Wat je hier wijzigt, gaat terug naar Huishouden.',
+};
+
+const descriptionFor = (lang: Lang) => DESCRIPTIONS[lang] ?? DESCRIPTIONS.en;
