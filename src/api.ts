@@ -8,8 +8,9 @@ import { log } from './log';
 import { authOptions, overQuota } from './person';
 import { Calendar, CalendarApiError } from './google/api';
 import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, revokeGoogle } from './google/oauth';
-import { deletePerson, deletePersonRows, loadPerson, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
-import { syncPerson } from './sync';
+import { deletePerson, deletePersonRows, loadPerson, moveFeed, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
+import { lastChecked } from './tick';
+import { FEED, markWork, SYNC } from './work';
 
 /**
  * What the portal's Calendar page calls, as the signed-in person (their Firebase ID token in
@@ -21,8 +22,11 @@ import { syncPerson } from './sync';
  * - `POST /api/feed/rotate`: a new secret URL; the old one stops working.
  * - `POST /api/feed/revoke`: no feed.
  * - `POST /api/google/connect`: Google's one-time code from the portal's popup; creates the
- *   "Huishouden" calendar and syncs it.
- * - `POST /api/google/sync`: sync now.
+ *   "Huishouden" calendar and queues its first sync.
+ * - `POST /api/google/sync`: sync now (queued: it runs within seconds, never in the request).
+ *
+ * No call here builds a feed or writes to Google: those are queued as work (src/work.ts), each in
+ * its own invocation, so no request needs more than a few milliseconds of CPU.
  * - `POST /api/google/disconnect`: stop syncing; `deleteCalendar: true` also deletes the calendar.
  */
 
@@ -131,6 +135,11 @@ async function status(env: Env, request: Request, who: Caller) {
   const record = await loadPerson(env, who.pid);
   const row = await personRow(env, who.pid);
   const base = origin(request);
+  // Quiet checks write nothing per person: the last check is their slot's (src/tick.ts), unless
+  // their own run since then says otherwise.
+  const checked = row && record?.google && !row.last_error ? await lastChecked(env, row.shard, true) : 0;
+  const lastOk = Math.max(row?.last_ok ?? 0, checked) || null;
+  const lastSync = Math.max(row?.last_sync ?? 0, checked) || null;
   const feed = record?.feed ? feedUrl(base, record.feed.secret) : null;
   return {
     feed: feed ? { url: feed, webcal: feed.replace(/^https?:/, 'webcal:'), createdAt: record!.feed!.createdAt } : null,
@@ -140,8 +149,8 @@ async function status(env: Env, request: Request, who: Caller) {
       ? {
           account: record.google.account,
           connectedAt: record.google.connectedAt,
-          lastSync: row?.last_sync ?? null,
-          lastOk: row?.last_ok ?? null,
+          lastSync,
+          lastOk,
           error: row?.last_error ?? null,
           notice: row?.notice ?? null,
           counts: row?.counts ? (JSON.parse(row.counts) as Record<string, number>) : null,
@@ -170,16 +179,21 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
         if (!record.feed) record.feed = { secret: await newFeed(env, who.pid), createdAt: now };
         await savePerson(env, who.pid, record);
         await upsertPersonRow(env, who.pid, { feed: 1 }, now);
+        // The link works the moment the portal shows it: the feed is built now, in its own invocation
+        // (env.SELF), never in this request's. Without one, queued.
+        await buildNow(env, who.pid, now);
         log('api', { route: 'feed', ok: true });
         return json(200, await status(env, request, who), headers);
       }
       case 'POST /api/feed/rotate': {
         const record = await personFrom(env, who, b, fetchImpl);
-        if (record.feed) await revokeFeed(env, record.feed.secret);
+        const old = record.feed?.secret;
+        if (old) await revokeFeed(env, old);
         record.feed = { secret: await newFeed(env, who.pid), createdAt: now };
         await savePerson(env, who.pid, record);
-        await env.DB.prepare('DELETE FROM feeds WHERE pid = ?').bind(who.pid).run();
         await upsertPersonRow(env, who.pid, { feed: 1 }, now);
+        // The new URL serves the same calendar at once (sealed again for it); the old one stops.
+        if (!old || !(await moveFeed(env, who.pid, old, record.feed.secret))) await buildNow(env, who.pid, now);
         log('api', { route: 'rotate', ok: true });
         return json(200, await status(env, request, who), headers);
       }
@@ -220,16 +234,14 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
         record.google = { refreshToken: granted.refreshToken, calendarId, account: granted.account, scope: CALENDAR_SCOPE, connectedAt: now };
         await savePerson(env, who.pid, record);
         await upsertPersonRow(env, who.pid, { google: 1, last_error: null, notice: null }, now);
+        await markWork(env, who.pid, SYNC, now);
         log('api', { route: 'google-connect', ok: true });
-        const first = syncPerson(env, who.pid, deps).catch(() => undefined);
-        if (ctx) ctx.waitUntil(first);
-        else await first;
         return json(200, await status(env, request, who), headers);
       }
       case 'POST /api/google/sync': {
         const record = await loadPerson(env, who.pid);
         if (!record?.google) throw new HttpError(409, 'not-connected');
-        await syncPerson(env, who.pid, deps);
+        await markWork(env, who.pid, SYNC, now);
         return json(200, await status(env, request, who), headers);
       }
       case 'POST /api/google/disconnect': {
@@ -273,6 +285,18 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
     log('api', { route: url.pathname, ok: false, status: 500, ...causeOf(e) });
     return json(500, { error: 'server' }, headers);
   }
+}
+
+/** The person's feed built before the answer, in another invocation of this Worker; queued when there is none. */
+async function buildNow(env: Env, pid: string, now: number): Promise<void> {
+  if (!env.SELF) {
+    await markWork(env, pid, FEED, now);
+    return;
+  }
+  await markWork(env, pid, FEED, now, { queue: false });
+  const outcome = await env.SELF.work(pid).catch(() => null);
+  // Busy, failed or backing off: the queue takes it from here.
+  if (!outcome || !('done' in outcome)) await markWork(env, pid, 0, now);
 }
 
 const DESCRIPTIONS: Record<Lang, string> = {

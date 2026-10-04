@@ -16,6 +16,15 @@ export interface Env {
   ALLOWED_ORIGINS: string;
   /** The Google calendar's name: "Huishouden". */
   CALENDAR_NAME?: string;
+  /** The work queue (src/work.ts): one message per person with work. Optional: the cron runs work without it. */
+  WORK?: Queue<{ pid: string }>;
+  /** This Worker's own `Fanout` entrypoint (src/index.ts): each call is its own invocation, with its own CPU time and subrequests. */
+  SELF?: FanoutRpc;
+  /**
+   * Firestore reads a day the checks may use (src/tick.ts `periodsFor`): they check less often
+   * rather than go over it. Unset: no limit (a project on the Blaze plan).
+   */
+  FIRESTORE_CHECK_READS?: string;
   /** Firestore's REST base, for the emulator in tests and `wrangler dev`; production leaves it out. */
   FIRESTORE_URL?: string;
 }
@@ -28,3 +37,9 @@ export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
  * is called as a method (`this.fetchImpl(...)`), so it is never stored bare as a default.
  */
 export const globalFetch: Fetch = (url, init) => fetch(url, init);
+
+/** What the cron fans out to (src/index.ts `Fanout`), and the queue's next unit. */
+export interface FanoutRpc {
+  check(pids: string[]): Promise<import('./check').CheckTotals>;
+  work(pid: string): Promise<import('./work').WorkOutcome>;
+}
