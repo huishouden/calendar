@@ -1,5 +1,5 @@
 import { exchangeRefreshToken, FirebaseAuthError, verifyIdToken } from '@huishouden/pwa-kit/firebase-auth-rest';
-import { FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
+import { FirestoreError, FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
 import { isLang, type Lang } from '@huishouden/pwa-kit/i18n';
 import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
 import type { Env, Fetch } from './env';
@@ -69,7 +69,12 @@ async function caller(env: Env, request: Request, household: string | null, fetc
   }
   // A member reads their household; anyone else is refused by the rules.
   const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, ...(fetchImpl ? { fetch: fetchImpl } : {}), ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}) });
-  const doc = await db.get(`households/${household}`).catch(() => null);
+  // Only the rules' refusal (or no such household) means "not a member". Anything else, such as
+  // Firestore's daily quota (429 RESOURCE_EXHAUSTED) or an outage, is the service being unavailable.
+  const doc = await db.get(`households/${household}`).catch((e: unknown) => {
+    if (e instanceof FirestoreError && (e.code === 'permission-denied' || e.code === 'not-found')) return null;
+    throw new HttpError(503, 'unavailable');
+  });
   const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
   if (!members.includes(who.email)) throw new HttpError(403, 'not-member');
   return { ...who, household, pid: await personId(household, who.email), idToken };
