@@ -246,9 +246,11 @@ one, and a household may have several (two partners' cards). Helpers and kids ne
 
 | File | Does |
 |---|---|
-| `src/mail/api.ts` | Spending's calls: status, connect, check now, disconnect |
+| `src/mail/api.ts` | Spending's calls: status, connect, check now, disconnect, the review list and its answers, undo last import |
 | `src/mail/check.ts` | The checks: every 5 minutes per inbox, fanned out after the calendar's (`SELF.mail`) |
 | `src/mail/work.ts` | One unit of an inbox's import (queue message `{ inbox }`): search, read, parse, write |
+| `src/mail/recheck.ts` | Reading alerts (the kit's `readAlert`), and re-reading past imports when `PARSER_VERSION` goes up |
+| `src/mail/shape.ts` | The masked shape of each email read (`mail_shapes`), for supporting new alert formats |
 | `src/mail/gmail.ts` | Gmail's `profile`, `history.list`, `messages.list`, `messages.get` |
 | `src/mail/inbox.ts`, `src/mail/store.ts` | The household side as the member (cards, rules, the inbox's document); sealed records in D1 |
 
@@ -267,6 +269,30 @@ one, and a household may have several (two partners' cards). Helpers and kids ne
    the oldest (`planAlerts`: statements and other members' alerts are not added twice), and writes
    the new ones as `spendingTransactions` (`source: 'alert'`) **as the member who connected the
    inbox**, so the household's rules apply. The inbox's document gets `lastAlertAt` and `lastAdded`.
+
+**Only what it reads with confidence is written.** The kit's `readAlert` makes a transaction only
+when a purchase rule (an issuer's wording such as Visa Purchase Alerts or "You made a $X
+transaction with M", or a generic "purchase/transaction/charge of $X at M") finds both the amount
+and a merchant it can trust; never "Card Purchase", never prose ("at a reasonable price"), and the
+amount is the rule's, not the first one in the email. Payments, declined charges, statements,
+security notices and mail sent to a list without purchase wording (offers, an investing account's
+notices) are left alone. Emails that look like purchases but can't be read go to a **review list**:
+Spending shows "Last import: N added, M need review", and the member who connected the inbox sees
+each email's subject and date and answers Not a purchase or enters it. The date is the
+transaction's own when the email writes one (at most 10 days before it), else the day it was sent
+in the household's time zone.
+
+**Each import has an id** (`importId` on the transactions it wrote): **Undo last import** (the
+member who connected the inbox, or an admin) deletes them as the caller, and their emails are never
+written again.
+
+**Re-reading past imports.** `PARSER_VERSION` (src/mail/recheck.ts) goes up whenever the way alerts
+are read changes. An inbox read with an older one is re-read, 3 emails a unit, once nothing new is
+waiting: by each email's Gmail id in the seen list, as the member, a transaction the checker wrote
+(`al-<id>`, by that member, after connecting) is corrected when the email now reads as a purchase,
+deleted when it is not one (or can't be read: then it goes to the review list), and a purchase it
+missed is written. Answered emails, transactions someone deleted, statement rows and alerts the
+app's own Check email wrote are left alone.
 
 The household's cards, labels and category rules are read as the member when an inbox is
 connected, on Check now, and at most every 12 hours, and kept sealed with the inbox. So a check
@@ -293,9 +319,16 @@ transactions it added stay: they are the household's.
   accounts can grant it. The Worker uses the grant only to search the household's alert words and
   labels and to read the messages that match.
 - What is kept from an email is what Spending writes for it: date, merchant, amount, category, card
-  (last four digits), and the Gmail message id. Nothing else of an email is stored, and nothing of
+  (last four digits), and the Gmail message id; the review list and shapes below. Nothing else of an email is stored, and nothing of
   one is logged. The logs hold counts (`found`, `read`, `added`, `duplicates`), never an address,
   sender, subject or merchant; the Worker sends nothing to New Relic.
+- To support alert formats it can't read yet, D1 keeps each email's **shape** for 14 days
+  (`mail_shapes`): the sender's domain (its address only when that is a role such as `alerts@`), and
+  the subject and the lines with an amount or purchase wording with every word outside a fixed
+  alert vocabulary, every all-capitals word, every number and amount masked ("You made a $#
+  transaction with X on your card ending in #"), and what the parser made of it. No merchant, name,
+  amount or address survives. The subjects on the review list are sealed (`review:<inbox>`) and
+  shown only to the member who connected the inbox.
 - D1 holds each inbox under a hash; who connected it, its address, Google's refresh token, the
   member's Firebase sign-in and the household's search terms are sealed (AES-GCM, `SEAL_KEY`).
   Firestore holds only the address, who connected it and what the checker last found

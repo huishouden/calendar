@@ -4,6 +4,7 @@ import { slotsFor } from '../tick';
 import { accessToken, GoogleAuthError } from '../google/oauth';
 import { Gmail, gmailRateLimited, HistoryGone } from './gmail';
 import { searchFor } from './inbox';
+import { PARSER_VERSION } from './recheck';
 import { openConfig, openRecord, STOPPED, unseen, type InboxRow } from './store';
 import { CONFIG_MAX_AGE_MS, markMailWork, sendMail, stopInbox } from './work';
 
@@ -64,8 +65,9 @@ export async function checkInboxes(env: Env, ids: string[], deps: MailCheckDeps 
       continue;
     }
     const configOld = !row.config_at || now - row.config_at >= CONFIG_MAX_AGE_MS;
-    if (row.pending || configOld) {
-      // Owed a search (or the cards are old): the import unit does it, with the household's latest.
+    const reread = row.rechecked < PARSER_VERSION && !row.error;
+    if (row.pending || configOld || reread) {
+      // Owed a search (or the cards are old, or past imports are to be read again): the import unit does it, with the household's latest.
       if (await markMailWork(env, row.id, now)) totals.queued++;
       totals.checked++;
       continue;
