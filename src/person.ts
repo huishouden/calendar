@@ -1,5 +1,5 @@
 import { exchangeRefreshToken, FirebaseAuthError, IdTokenCache, type AuthRestOptions } from '@huishouden/pwa-kit/firebase-auth-rest';
-import { FirestoreError, FirestoreRest, type FieldFilter } from '@huishouden/pwa-kit/firestore-rest';
+import { decodeFields, FirestoreError, FirestoreRest, type FieldFilter } from '@huishouden/pwa-kit/firestore-rest';
 import { PERSONAL_AGENDA, toAgendaItem, type AgendaItem } from '@huishouden/pwa-kit/agenda-core';
 import { PERSONAL_TODOS, toTodoItem, type TodoItem } from '@huishouden/pwa-kit/todo-core';
 import { isRestricted, ROLES, type Role } from '@huishouden/pwa-kit/role-core';
@@ -60,9 +60,19 @@ const roleOf = (data: Record<string, unknown>, email: string): Role => {
   return members[0] === email ? 'admin' : 'member';
 };
 
+/**
+ * Reads a household's members have in common, made once per check run (src/check.ts) and used for
+ * each of them: the shared lists' count and sum are the same query whoever of them asks, and only
+ * ever go into each member's own change signal.
+ */
+export type Shared = Map<string, Promise<{ count: number; sums: Record<string, number> }>>;
+
 export class Person {
   readonly db: FirestoreRest;
   readonly base: string;
+  private readonly token: () => Promise<string>;
+  private readonly fetchImpl: Fetch;
+  private readonly firestoreUrl: string;
 
   constructor(
     readonly env: Env,
@@ -71,29 +81,62 @@ export class Person {
     firestoreUrl?: string,
   ) {
     const cache = tokenCache(env, fetchImpl);
+    this.token = async () => (await cache.get(record.refreshToken)).token;
+    this.fetchImpl = fetchImpl ?? ((url, init) => fetch(url, init));
+    this.firestoreUrl = (firestoreUrl ?? env.FIRESTORE_URL ?? 'https://firestore.googleapis.com/v1').replace(/\/$/, '');
     this.db = new FirestoreRest({
       projectId: env.FIREBASE_PROJECT_ID,
-      token: async () => (await cache.get(record.refreshToken)).token,
+      token: this.token,
       ...(fetchImpl ? { fetch: fetchImpl } : {}),
       ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}),
     });
     this.base = `households/${record.household}`;
   }
 
-  /** Who they are in the household now, and their settings. Throws `NotMember` when they have left. */
+  /** Several documents in one request (`documents:batchGet`), in order; null for a missing one. */
+  private async getAll(paths: string[]): Promise<(Record<string, unknown> | null)[]> {
+    const root = `projects/${this.env.FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.firestoreUrl}/${root}:batchGet`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${await this.token()}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ documents: paths.map((p) => `${root}/${p}`) }),
+      });
+    } catch {
+      throw new FirestoreError('unavailable', 'Firestore unreachable');
+    }
+    const parsed = (await res.json().catch(() => null)) as unknown;
+    if (!res.ok || !Array.isArray(parsed)) {
+      const error = (Array.isArray(parsed) ? parsed[0] : parsed) as { error?: { status?: string } } | null;
+      const status = error?.error?.status ?? '';
+      throw new FirestoreError(status === 'PERMISSION_DENIED' || res.status === 403 ? 'permission-denied' : status === 'UNAVAILABLE' ? 'unavailable' : 'unknown', `Firestore ${res.status} ${status}`.trim());
+    }
+    const found = new Map<string, Record<string, unknown>>();
+    for (const r of parsed as { found?: { name: string; fields?: Record<string, never> } }[]) {
+      if (r.found) found.set(r.found.name.slice(root.length + 1), decodeFields(r.found.fields));
+    }
+    return paths.map((p) => found.get(p) ?? null);
+  }
+
+  /**
+   * Who they are in the household now, and their settings: the household and their settings in one
+   * request. Throws `NotMember` when they have left.
+   */
   async view(): Promise<View> {
     const email = this.record.email;
-    let household;
+    let household: Record<string, unknown> | null;
+    let settings: Record<string, unknown> | null;
     try {
-      household = await this.db.get(this.base);
+      [household, settings] = await this.getAll([this.base, `${this.base}/${CALENDAR_SETTINGS}/${email}`]);
     } catch (e) {
       if (e instanceof FirestoreError && e.code === 'permission-denied') throw new NotMember('Not a member');
       throw e;
     }
-    const members = Array.isArray(household?.data.members) ? (household!.data.members as unknown[]) : [];
+    const members = Array.isArray(household?.members) ? (household!.members as unknown[]) : [];
     if (!household || !members.includes(email)) throw new NotMember('Not a member');
-    const role = roleOf(household.data, email);
-    const stored = await this.db.get(`${this.base}/${CALENDAR_SETTINGS}/${email}`);
+    const role = roleOf(household, email);
+    const stored = settings ? { data: settings } : null;
     return {
       household: this.record.household,
       email,
@@ -127,12 +170,25 @@ export class Person {
    * and the sum of their `updatedAt` (one aggregation each), plus their role and settings. Any
    * item added, changed or removed moves it.
    */
-  async signal(view: View, extra = ''): Promise<string> {
+  async signal(view: View, extra = '', shared?: Shared): Promise<string> {
     const zero = { count: 0, sums: { updatedAt: 0 } };
+    const common = (collection: string) => {
+      const run = () => this.db.aggregate(this.base, collection, { where: this.shared(view) }, ['updatedAt']);
+      if (!shared) return run();
+      const key = `${this.record.household}|${collection}|${view.restricted}`;
+      let hit = shared.get(key);
+      if (!hit) {
+        hit = run();
+        shared.set(key, hit);
+        // A failed read is not kept: the next member asks again, as themselves.
+        hit.catch(() => shared.delete(key));
+      }
+      return hit;
+    };
     const [agenda, personal, todos, personalTodos] = await Promise.all([
-      this.db.aggregate(this.base, 'agenda', { where: this.shared(view) }, ['updatedAt']),
+      common('agenda'),
       this.optional(() => this.db.aggregate(this.base, PERSONAL_AGENDA, { where: this.mine(view) }, ['updatedAt']), zero),
-      view.settings.todos ? this.db.aggregate(this.base, 'todos', { where: this.shared(view) }, ['updatedAt']) : Promise.resolve(zero),
+      view.settings.todos ? common('todos') : Promise.resolve(zero),
       view.settings.todos ? this.optional(() => this.db.aggregate(this.base, PERSONAL_TODOS, { where: this.mine(view) }, ['updatedAt']), zero) : Promise.resolve(zero),
     ]);
     return contentHash(JSON.stringify([agenda, personal, todos, personalTodos, view.role, view.settingsAt, view.settings, extra]));

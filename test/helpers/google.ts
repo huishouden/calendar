@@ -28,6 +28,14 @@ export class FakeGoogle {
   /** Every request, method and path (batches counted once, and their parts listed). */
   calls: string[] = [];
   account = 'alice@example.com';
+  /** Answer the next `count` Calendar API requests (list, batch) with this error, as Google's rate limits do. */
+  failNext: { status: number; reason: string; count: number } | null = null;
+
+  private failing(): Response | null {
+    if (!this.failNext || this.failNext.count <= 0) return null;
+    this.failNext.count--;
+    return json(this.failNext.status, { error: { code: this.failNext.status, message: 'Rate Limit Exceeded', errors: [{ reason: this.failNext.reason }] } });
+  }
   private refreshCount = 0;
 
   constructor(private readonly clock: () => number) {}
@@ -82,8 +90,10 @@ export class FakeGoogle {
     const method = (init.method ?? 'GET').toUpperCase();
     const u = new URL(url);
     if (u.hostname === 'oauth2.googleapis.com') return this.oauth(u, String(init.body ?? ''));
-    if (u.href.startsWith('https://www.googleapis.com/batch/calendar/v3')) return this.batch(init);
+    if (u.href.startsWith('https://www.googleapis.com/batch/calendar/v3')) return this.failing() ?? this.batch(init);
     if (u.href.startsWith('https://www.googleapis.com/calendar/v3/')) {
+      const refused = this.failing();
+      if (refused) return refused;
       this.calls.push(`${method} ${u.pathname}`);
       const auth = new Headers(init.headers).get('Authorization');
       if (!auth?.startsWith('Bearer g-access')) return json(401, { error: { message: 'Invalid Credentials' } });

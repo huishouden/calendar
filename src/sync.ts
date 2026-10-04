@@ -2,10 +2,9 @@ import { exportEvents, loadExportLang, type ExportEvent } from '@huishouden/pwa-
 import type { AgendaItem } from '@huishouden/pwa-kit/agenda-core';
 import { LocalClock } from '@huishouden/pwa-kit/local-clock';
 import type { Env, Fetch } from './env';
-import { log } from './log';
 import { NotMember, Person, signInGone, type Loaded, type View } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
-import { Calendar, CalendarApiError, SyncTokenGone, type BatchRequest, type GoogleEvent } from './google/api';
+import { Calendar, CalendarApiError, rateLimited, reasonOf, SyncTokenGone, type BatchRequest, type GoogleEvent } from './google/api';
 import { eventId, googleBody, instanceId, overrideBody, regularBody } from './google/events';
 import { applyEdit, dateFormatter, readChange, snapshot, type Edit, type Written } from './backsync';
 import { deleteEventRow, eventRows, loadPerson, personRow, putEventRow, savePerson, upsertPersonRow, type EventRow, type PersonRecord } from './store';
@@ -27,8 +26,11 @@ import { deleteEventRow, eventRows, loadPerson, personRow, putEventRow, savePers
  */
 
 export const FULL_EVERY_MS = 6 * 3_600_000;
-/** Writes per person per run; the rest go next run. */
-export const MAX_WRITES = 200;
+/**
+ * Writes per run: one batch request. A run is one small unit of work (the free plan's 10 ms of CPU
+ * per invocation); the rest go in the next unit, which the work queues straight away (src/work.ts).
+ */
+export const MAX_WRITES = 50;
 
 export interface SyncCounts {
   changes: number;
@@ -41,11 +43,15 @@ export interface SyncCounts {
   updated: number;
   deleted: number;
   failed: number;
+  /** Writes Google refused as too many (429, or 403 rate limit): the work backs off. */
+  limited: number;
   requests: number;
   full: boolean;
+  /** Writes left for the next unit. */
+  more: boolean;
 }
 
-const zero = (): SyncCounts => ({ changes: 0, echoes: 0, applied: 0, refused: 0, conflicts: 0, hidden: 0, inserted: 0, updated: 0, deleted: 0, failed: 0, requests: 0, full: false });
+const zero = (): SyncCounts => ({ changes: 0, echoes: 0, applied: 0, refused: 0, conflicts: 0, hidden: 0, inserted: 0, updated: 0, deleted: 0, failed: 0, limited: 0, requests: 0, full: false, more: false });
 
 export interface SyncDeps {
   fetch?: Fetch;
@@ -68,7 +74,7 @@ const parseOverrides = (s: string | null): Override[] => {
 };
 
 /** Whether a changed Google event is our own write coming back. */
-function isEcho(g: GoogleEvent, row: EventRow | undefined): boolean {
+export function isEcho(g: GoogleEvent, row: EventRow | undefined): boolean {
   if (!row || !g.etag) return false;
   if (row.etag === g.etag) return true;
   return parseOverrides(row.overrides).some((o) => o.etag === g.etag);
@@ -232,6 +238,7 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
     const gone = p.kind === 'delete' && (res.status === 404 || res.status === 410);
     if (!ok && !gone) {
       counts.failed++;
+      if (rateLimited(res.status, reasonOf(res.body))) counts.limited++;
       return;
     }
     if (p.kind === 'insert') counts.inserted++;
@@ -266,6 +273,7 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
   if (statements.length) await env.DB.batch(statements);
   counts.requests = calendar.requests;
   const finished = plan.requests.length <= MAX_WRITES && counts.failed === 0;
+  counts.more = plan.requests.length > MAX_WRITES && counts.failed === 0;
   await upsertPersonRow(
     env,
     pid,
@@ -352,31 +360,4 @@ export async function planWrites(
   // Deletions first, so a full calendar never briefly holds an item twice.
   requests.sort((a, b) => Number(b.kind === 'delete') - Number(a.kind === 'delete'));
   return { requests, rows: next };
-}
-
-/** Per run: subrequests the cron keeps for each person (a token, the change list, the checks, batches). */
-export const PER_PERSON_BUDGET = 12;
-
-/** The cron: as many people as the run's budget allows, the longest unsynced first. */
-export async function runCron(env: Env, deps: SyncDeps & { budget?: number } = {}): Promise<Record<string, number>> {
-  const budget = deps.budget ?? 45;
-  const people = await env.DB.prepare('SELECT pid FROM people WHERE google = 1 ORDER BY COALESCE(last_sync, 0) ASC LIMIT ?').bind(Math.max(1, Math.floor(budget / PER_PERSON_BUDGET))).all<{ pid: string }>();
-  const totals: Record<string, number> = { people: 0, failed: 0 };
-  let used = 0;
-  for (const { pid } of people.results) {
-    if (used + PER_PERSON_BUDGET > budget) break;
-    try {
-      const c = await syncPerson(env, pid, deps);
-      totals.people++;
-      used += Math.max(c.requests + 8, 4);
-      for (const [k, v] of Object.entries(c)) if (typeof v === 'number') totals[k] = (totals[k] ?? 0) + v;
-    } catch (e) {
-      totals.failed++;
-      used += PER_PERSON_BUDGET;
-      const reason = e instanceof CalendarApiError ? `google-${e.status}` : e instanceof GoogleAuthError ? `google-${e.kind}` : 'error';
-      await upsertPersonRow(env, pid, { last_sync: deps.now ?? Date.now(), last_error: reason }, deps.now ?? Date.now());
-    }
-  }
-  log('sync-run', totals);
-  return totals;
 }

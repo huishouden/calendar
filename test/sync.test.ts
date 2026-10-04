@@ -1,10 +1,13 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
-import { syncPerson, runCron } from '../src/sync';
+import { syncPerson, MAX_WRITES } from '../src/sync';
+import { runCron, pack, periodsFor, slotsFor, GOOGLE_EVERY_MIN, FEED_EVERY_MIN, MAX_CALLS, READS_PER_CHECK } from '../src/tick';
+import { runWork, SYNC, FEED, markWork } from '../src/work';
+import { checkPeople } from '../src/check';
 import { personId, loadPerson } from '../src/store';
 import { eventId, instanceId } from '../src/google/events';
 import { captureLogs } from '../src/log';
-import { apiRequest, household, listDocs, readDoc, refreshFor, resetFirestore, seed, world, writeDoc, TZ, type World } from './helpers/world';
+import { apiRequest, drain, FIRESTORE, household, listDocs, readDoc, refreshFor, resetFirestore, seed, world, writeDoc, TZ, type World } from './helpers/world';
 
 let w: World;
 
@@ -24,6 +27,8 @@ const call = (path: string, email: string, body?: Record<string, unknown>) => ha
 async function connect(email = 'alice@example.com'): Promise<{ pid: string; calendarId: string }> {
   const res = await call('/api/google/connect', email, { household, code: 'good-code', refreshToken: refreshFor(email), lang: 'en', timeZone: TZ });
   expect(res.status).toBe(200);
+  // The first sync is queued work, never part of the request.
+  await drain(w);
   const pid = await personId(household, email);
   const calendarId = (await loadPerson(w.env, pid))!.google!.calendarId;
   return { pid, calendarId };
@@ -122,7 +127,7 @@ describe('keeping it in step', () => {
 
   test('an item gone from the agenda leaves the calendar; one added arrives', async () => {
     const { pid, calendarId } = await connect();
-    await fetch(`http://127.0.0.1:8080/v1/projects/demo-huishouden-calendar/databases/(default)/documents/households/${household}/todos/${encodeURIComponent('tasks:item:paint')}`, { method: 'DELETE', headers: { Authorization: 'Bearer owner' } });
+    await fetch(`${FIRESTORE}/projects/demo-huishouden-calendar/databases/(default)/documents/households/${household}/todos/${encodeURIComponent('tasks:item:paint')}`, { method: 'DELETE', headers: { Authorization: 'Bearer owner' } });
     await writeDoc(`households/${household}/agenda/home_job_filter`, { app: 'home', ref: 'job:filter', kind: 'due', title: 'Change the furnace filter', start: Date.parse('2031-10-15T00:00:00+02:00'), allDay: true, url: 'https://huishouden-piekstra.web.app/home/', status: 'upcoming', private: false, updatedAt: w.clock.now, by: 'bob@example.com' });
     const counts = await later(pid);
     expect([counts.inserted, counts.deleted]).toEqual([1, 1]);
@@ -133,15 +138,192 @@ describe('keeping it in step', () => {
     expect(job.start).toEqual({ date: '2031-10-15' });
   });
 
-  test('the cron syncs people in turn, counts only in its log', async () => {
-    await connect('alice@example.com');
-    await connect('bob@example.com');
+  test('the cron checks each person once in 5 minutes, fanned out, and queues only who changed; counts only in its log', async () => {
+    const a = await connect('alice@example.com');
+    const b = await connect('bob@example.com');
+    const checked: string[][] = [];
+    const self = w.env.SELF!;
+    w.env.SELF = { ...self, check: (pids) => (checked.push(pids), self.check(pids)) };
+    // Our own writes come back as echoes once; let the checks take those first.
+    for (let m = 0; m < GOOGLE_EVERY_MIN; m++) await runCron(w.env, { fetch: w.fetch, now: w.clock.now + m * MIN });
+    w.clock.now += GOOGLE_EVERY_MIN * MIN;
+    await drain(w);
+    checked.length = 0;
+    const path = `households/${household}/agenda/baby_appointment_a1`;
+    await writeDoc(path, { ...(await readDoc(path))!, title: 'Checkup at 18 months', updatedAt: w.clock.now });
     const logs = captureLogs();
-    w.clock.now += 5 * MIN;
-    const totals = await runCron(w.env, { fetch: w.fetch, now: w.clock.now });
+    const totals: Record<string, number>[] = [];
+    for (let m = 0; m < GOOGLE_EVERY_MIN; m++) totals.push(await runCron(w.env, { fetch: w.fetch, now: w.clock.now + m * MIN }));
     logs.restore();
-    expect(totals.people).toBe(2);
+    // Each person exactly once in the five minutes, in its own invocation's chunk.
+    expect(checked.flat().sort()).toEqual([a.pid, b.pid].sort());
+    expect(totals.reduce((n, t) => n + t.marked, 0)).toBe(2);
+    expect(w.queue.map((m) => m.pid).sort()).toEqual([a.pid, b.pid].sort());
+    await drain(w);
+    for (const p of [a, b]) expect(w.google.cal(p.calendarId).events.get((await ids(p.pid)).checkup)!.summary).toBe('Checkup at 18 months');
     expect(logs.lines.join('\n')).not.toMatch(/example\.com|Checkup|Garbage|h1/);
+  });
+});
+
+describe('fan-out and the queue', () => {
+  test('slots: Google people every 5 minutes, feed-only people every 15; a household together', () => {
+    for (let m = 0; m < 60; m++) {
+      expect(slotsFor(m, GOOGLE_EVERY_MIN).length).toBe(12);
+      expect(slotsFor(m, FEED_EVERY_MIN).length).toBe(4);
+    }
+    const all = new Set(Array.from({ length: GOOGLE_EVERY_MIN }, (_, m) => slotsFor(m, GOOGLE_EVERY_MIN)).flat());
+    expect(all.size).toBe(60);
+    const rows = [...'abcdefghij'].map((c, i) => ({ pid: c, hh: i < 3 ? 'h-x' : i < 6 ? 'h-y' : null }));
+    const chunks = pack(rows, 4);
+    expect(chunks.every((c) => c.length <= 4)).toBe(true);
+    expect(chunks.flat().sort()).toEqual([...'abcdefghij']);
+    expect(chunks.some((c) => ['a', 'b', 'c'].every((p) => c.includes(p)))).toBe(true);
+    expect(chunks.some((c) => ['d', 'e', 'f'].every((p) => c.includes(p)))).toBe(true);
+  });
+
+  test('a Firestore read budget: the checks slow down rather than go over it', () => {
+    expect(periodsFor(1000, 1000)).toEqual({ google: 5, feed: 15 });
+    // 20 people with Google and 20 with a feed: every 5 minutes would be 38,400 reads a day.
+    expect(periodsFor(20, 20, 20_000)).toEqual({ google: 15, feed: 15 });
+    const p = periodsFor(20, 20, 20_000);
+    expect((20 * 1440 / p.google + 20 * 1440 / p.feed) * READS_PER_CHECK).toBeLessThanOrEqual(20_000);
+    expect(periodsFor(5, 0, 20_000)).toEqual({ google: 5, feed: 15 });
+    expect(periodsFor(1000, 0, 20_000)).toEqual({ google: 60, feed: 60 });
+  });
+
+  test('a household’s members share its reads: fewer Firestore requests than one check each', async () => {
+    const people = await Promise.all(['alice@example.com', 'bob@example.com', 'cora@example.com'].map(async (e) => (await connect(e)).pid));
+    let firestore = 0;
+    const counting = (url: string, init?: RequestInit) => {
+      if (url.includes('/v1/projects/')) firestore++;
+      return w.fetch(url, init);
+    };
+    await checkPeople(w.env, [people[0]], { fetch: counting, now: w.clock.now });
+    const one = firestore;
+    firestore = 0;
+    await checkPeople(w.env, people, { fetch: counting, now: w.clock.now });
+    expect(firestore).toBeLessThan(3 * one);
+  });
+
+  test('per-person order: a unit holding the person makes another wait; the checks leave them alone meanwhile', async () => {
+    const { pid } = await connect();
+    await w.env.DB.prepare('UPDATE people SET work = ?, lease_until = ? WHERE pid = ?').bind(SYNC, w.clock.now + 60_000, pid).run();
+    const busy = await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now });
+    expect(busy).toEqual({ retryAfter: 30, reason: 'busy' });
+    const totals = await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now });
+    expect(totals.skipped).toBe(1);
+    // Once the lease ends (or runs out), the waiting unit runs.
+    w.clock.now += 61_000;
+    expect('done' in (await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now }))).toBe(true);
+    expect((await w.env.DB.prepare('SELECT work, lease_until FROM people WHERE pid = ?').bind(pid).first<Record<string, unknown>>())).toEqual({ work: 0, lease_until: null });
+  });
+
+  test('feed and sync for one person: two units, one after the other, each its own invocation', async () => {
+    await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
+    const { pid } = await connect();
+    const units: string[] = [];
+    const self = w.env.SELF!;
+    w.env.SELF = { ...self, work: async (p) => (units.push('next'), self.work(p)) };
+    const path = `households/${household}/agenda/baby_appointment_a1`;
+    await writeDoc(path, { ...(await readDoc(path))!, title: 'Checkup at 18 months', updatedAt: w.clock.now + MIN });
+    const totals = await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now });
+    expect(totals.marked).toBe(1);
+    expect((await w.env.DB.prepare('SELECT work FROM people WHERE pid = ?').bind(pid).first<{ work: number }>())!.work).toBe(FEED | SYNC);
+    expect(w.queue.length).toBe(1);
+    const first = await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now, next: (p) => w.env.SELF!.work(p) });
+    w.queue.length = 0;
+    expect(first).toEqual({ done: true, kind: 'sync', more: true });
+    expect(units).toEqual(['next']);
+    expect((await w.env.DB.prepare('SELECT work FROM people WHERE pid = ?').bind(pid).first<{ work: number }>())!.work).toBe(0);
+  });
+
+  test('more than one unit of writes: the rest goes in the next unit straight away', async () => {
+    const { pid, calendarId } = await connect();
+    // Many new items at once: more writes than one unit makes.
+    for (let i = 0; i < MAX_WRITES + 5; i++) {
+      await writeDoc(`households/${household}/agenda/home_job_x${i}`, { app: 'home', ref: `job:x${i}`, kind: 'due', title: `Job ${i}`, start: Date.parse('2031-10-15T00:00:00+02:00'), allDay: true, url: 'https://huishouden-piekstra.web.app/home/', status: 'upcoming', private: false, updatedAt: w.clock.now, by: 'bob@example.com' });
+    }
+    w.clock.now += MIN;
+    await markWork(w.env, pid, SYNC, w.clock.now);
+    let units = 0;
+    const self = w.env.SELF!;
+    w.env.SELF = { ...self, work: async (p) => (units++, self.work(p)) };
+    await drain(w);
+    expect(units).toBeGreaterThanOrEqual(1);
+    expect(w.google.live(calendarId).filter((e) => e.summary?.startsWith('Job ')).length).toBe(MAX_WRITES + 5);
+  });
+
+  test('Google says too many requests: the person backs off, doubling; the queue retries after it', async () => {
+    const { pid } = await connect();
+    const path = `households/${household}/agenda/baby_appointment_a1`;
+    await writeDoc(path, { ...(await readDoc(path))!, title: 'Checkup at 18 months', updatedAt: w.clock.now + MIN });
+    w.google.failNext = { status: 429, reason: 'rateLimitExceeded', count: 100 };
+    await markWork(w.env, pid, SYNC, w.clock.now);
+    const first = await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now });
+    expect(first).toEqual({ retryAfter: 30, reason: 'backoff' });
+    // Before the back-off ends: nothing asked of Google, and checks skip them.
+    const calls = w.google.calls.length;
+    expect(await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now + 10_000 })).toEqual({ retryAfter: 20, reason: 'backoff' });
+    expect((await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now + 10_000 })).skipped).toBe(1);
+    expect(w.google.calls.length).toBe(calls);
+    w.clock.now += 31_000;
+    expect(await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now })).toEqual({ retryAfter: 60, reason: 'backoff' });
+    w.google.failNext = null;
+    w.clock.now += 61_000;
+    expect(await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now })).toEqual({ done: true, kind: 'sync', more: false });
+    expect((await w.env.DB.prepare('SELECT backoff, backoff_until FROM people WHERE pid = ?').bind(pid).first<Record<string, unknown>>())).toEqual({ backoff: 0, backoff_until: null });
+  });
+
+  test('a 403 for rate limits backs off too; a 403 for access does not', async () => {
+    const { isRateLimited, CalendarApiError } = await import('../src/google/api');
+    expect(isRateLimited(new CalendarApiError(403, 'x', 'userRateLimitExceeded'))).toBe(true);
+    expect(isRateLimited(new CalendarApiError(403, 'x', 'quotaExceeded'))).toBe(true);
+    expect(isRateLimited(new CalendarApiError(403, 'x', 'forbidden'))).toBe(false);
+    expect(isRateLimited(new CalendarApiError(429, 'x'))).toBe(true);
+  });
+
+  test('the queue refuses (its daily operations used up): the work stays marked and the cron runs it', async () => {
+    const { pid, calendarId } = await connect();
+    const path = `households/${household}/agenda/baby_appointment_a1`;
+    await writeDoc(path, { ...(await readDoc(path))!, title: 'Checkup at 18 months', updatedAt: w.clock.now + MIN });
+    w.queueFull.on = true;
+    expect(await markWork(w.env, pid, SYNC, w.clock.now)).toBe(false);
+    expect((await w.env.DB.prepare('SELECT work, queued_at FROM people WHERE pid = ?').bind(pid).first<Record<string, unknown>>())).toEqual({ work: SYNC, queued_at: null });
+    const totals = await runCron(w.env, { fetch: w.fetch, now: w.clock.now });
+    expect(totals.worked).toBe(1);
+    expect(w.google.cal(calendarId).events.get((await ids(pid)).checkup)!.summary).toBe('Checkup at 18 months');
+  });
+
+  test('Firestore over its daily quota: the checks pause, and the cron starts none until then', async () => {
+    const { pid } = await connect();
+    const exhausted = async (url: string, init?: RequestInit) =>
+      url.includes('/v1/projects/') ? Response.json({ error: { code: 429, message: 'Quota exceeded.', status: 'RESOURCE_EXHAUSTED' } }, { status: 429 }) : w.fetch(url, init);
+    const totals = await checkPeople(w.env, [pid], { fetch: exhausted, now: w.clock.now });
+    expect(totals.paused).toBe(true);
+    let calls = 0;
+    const self = w.env.SELF!;
+    w.env.SELF = { ...self, check: async (p) => (calls++, self.check(p)) };
+    for (let m = 0; m < GOOGLE_EVERY_MIN; m++) await runCron(w.env, { fetch: w.fetch, now: w.clock.now + m * MIN });
+    expect(calls).toBe(0);
+    w.clock.now += 16 * MIN;
+    for (let m = 0; m < GOOGLE_EVERY_MIN; m++) await runCron(w.env, { fetch: w.fetch, now: w.clock.now + m * MIN });
+    expect(calls).toBe(1);
+  });
+
+  test('more people than one invocation can check: chunks, at most MAX_CALLS invocations, the portal’s last check from the slot', async () => {
+    const { pid } = await connect();
+    const row = (await w.env.DB.prepare('SELECT shard FROM people WHERE pid = ?').bind(pid).first<{ shard: number }>())!;
+    // Invented rows in the same slot (no records: their checks are no-ops).
+    for (let i = 0; i < 40; i++) await w.env.DB.prepare('INSERT INTO people (pid, created_at, shard, google, hh) VALUES (?, 0, ?, 1, ?)').bind(`fake${i}`, row.shard, `hh${i % 13}`).run();
+    const minute = slotsFor(row.shard, GOOGLE_EVERY_MIN)[0];
+    const at = Math.floor(w.clock.now / 3_600_000) * 3_600_000 + minute * MIN + 3_600_000;
+    const totals = await runCron(w.env, { fetch: w.fetch, now: at });
+    expect(totals.due).toBe(41);
+    expect(totals.calls).toBeLessThanOrEqual(MAX_CALLS);
+    expect(totals.calls).toBeGreaterThanOrEqual(Math.ceil(41 / 8));
+    expect(totals.deferred).toBe(0);
+    const status = (await (await call(`/api/status?household=${household}`, 'alice@example.com')).json()) as { google: { lastOk: number } };
+    expect(status.google.lastOk).toBe(at);
   });
 });
 

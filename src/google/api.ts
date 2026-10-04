@@ -14,9 +14,26 @@ export class CalendarApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** Google's reason (`rateLimitExceeded`, `forbidden`, ...), when it gave one. */
+    readonly reason = '',
   ) {
     super(message);
   }
+}
+
+/** Google's reasons for "slow down": a 429, or a 403 that is about rates or quota, not access. */
+const RATE_REASONS = /rateLimit|quotaExceeded|usageLimits|dailyLimit/i;
+
+export function rateLimited(status: number, reason = ''): boolean {
+  return status === 429 || (status === 403 && RATE_REASONS.test(reason));
+}
+
+export const isRateLimited = (e: unknown): boolean => e instanceof CalendarApiError && rateLimited(e.status, e.reason);
+
+/** The reason in a Calendar API error body (`error.errors[0].reason`, or `error.status`). */
+export function reasonOf(body: unknown): string {
+  const error = (body as { error?: { errors?: { reason?: string }[]; status?: string } } | null)?.error;
+  return error?.errors?.[0]?.reason ?? error?.status ?? '';
 }
 
 /** A sync token Google no longer accepts (410): list everything again. */
@@ -82,7 +99,7 @@ export class Calendar {
 
   private static fail(what: string, status: number, body: unknown): CalendarApiError {
     const message = (body as { error?: { message?: string } })?.error?.message ?? '';
-    return new CalendarApiError(status, `[${status}] Calendar ${what}${message ? `: ${message}` : ''}`);
+    return new CalendarApiError(status, `[${status}] Calendar ${what}${message ? `: ${message}` : ''}`, reasonOf(body));
   }
 
   async createCalendar(summary: string, description: string, timeZone: string): Promise<string> {
