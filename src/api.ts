@@ -2,6 +2,7 @@ import { exchangeRefreshToken, FirebaseAuthError, verifyIdToken } from '@huishou
 import { FirestoreError, FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
 import { isLang, type Lang } from '@huishouden/pwa-kit/i18n';
 import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
+import { householdTimeZone, toHome } from '@huishouden/pwa-kit/home';
 import type { Env, Fetch } from './env';
 import { feedUrl } from './feed';
 import { log } from './log';
@@ -71,6 +72,8 @@ interface Caller {
   idToken: string;
   /** Their role in the household (admin, member, helper, kid), from the household document read here. */
   role: string;
+  /** The household's home zone, when its home has one. */
+  homeZone?: string;
 }
 
 const HOUSEHOLD = /^[A-Za-z0-9_-]{1,128}$/;
@@ -99,7 +102,8 @@ async function caller(env: Env, request: Request, household: string | null, fetc
   });
   const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
   if (!members.includes(who.email)) throw new HttpError(403, 'not-member');
-  return { ...who, household, pid: await personId(household, who.email), idToken, role: roleOf(doc!.data, who.email) };
+  const homeZone = toHome(doc!.data.home)?.timeZone;
+  return { ...who, household, pid: await personId(household, who.email), idToken, role: roleOf(doc!.data, who.email), ...(homeZone ? { homeZone } : {}) };
 }
 
 async function body(request: Request): Promise<Record<string, unknown>> {
@@ -229,7 +233,7 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
         // Connecting again keeps the calendar it made before, when it is still there.
         let calendarId = record.google?.calendarId;
         if (!calendarId || !(await calendar.calendarExists(calendarId).catch(() => false))) {
-          calendarId = await calendar.createCalendar(env.CALENDAR_NAME ?? 'Huishouden', descriptionFor(record.lang), record.timeZone);
+          calendarId = await calendar.createCalendar(env.CALENDAR_NAME ?? 'Huishouden', descriptionFor(record.lang), householdTimeZone({ timeZone: who.homeZone }, record.timeZone));
           await calendar.colour(calendarId, GOOGLE_COLOUR);
           await env.DB.prepare('DELETE FROM events WHERE pid = ?').bind(who.pid).run();
           await upsertPersonRow(env, who.pid, { sync_token: null, signal: null, full_at: null }, now);

@@ -2,7 +2,7 @@ import { contentHash, exportEvents, exportIcs, loadExportLang } from '@huishoude
 import { icsProblems } from '@huishouden/pwa-kit/ics';
 import type { Env, Fetch } from './env';
 import { log } from './log';
-import { NotMember, Person, signInGone } from './person';
+import { NotMember, Person, signalExtra, signInGone, zoneOf } from './person';
 import { CalendarApiError, isRateLimited } from './google/api';
 import { GoogleAuthError } from './google/oauth';
 import { loadPerson, putFeed, revokeFeed, savePerson, upsertPersonRow } from './store';
@@ -158,11 +158,12 @@ export async function buildFeed(env: Env, pid: string, deps: WorkDeps = {}): Pro
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
   try {
     const view = await person.view();
-    const signal = await person.signal(view, `${record.lang}|${record.timeZone}`);
+    const signal = await person.signal(view, signalExtra(view, record));
     const loaded = await person.load(view);
     await loadExportLang(record.lang);
-    const events = exportEvents({ ...loaded, me: record.email, role: view.role, lang: record.lang, timeZone: record.timeZone, settings: view.settings });
-    const body = exportIcs(events, { householdId: record.household, timeZone: record.timeZone, lang: record.lang, now });
+    const timeZone = zoneOf(view, record);
+    const events = exportEvents({ ...loaded, me: record.email, role: view.role, lang: record.lang, timeZone, settings: view.settings, home: view.home?.address });
+    const body = exportIcs(events, { householdId: record.household, timeZone, lang: record.lang, now });
     await putFeed(env, pid, record.feed.secret, { signal, etag: `"${contentHash(body)}"`, body, now });
     log('feed', { built: true, events: events.length, problems: icsProblems(body).length });
   } catch (e) {
