@@ -1,6 +1,6 @@
 import type { Env, Fetch } from './env';
 import { log } from './log';
-import { NotMember, overQuota, Person, signInGone, type Shared } from './person';
+import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
 import { eventRows, feedRowOf, openPerson, savePerson, upsertPersonRow, type PersonRow } from './store';
@@ -140,7 +140,7 @@ async function checkOne(env: Env, row: PersonRow, deps: CheckDeps & { fetch: Fet
   let signal: string;
   try {
     const view = await person.view();
-    signal = await person.signal(view, `${record.lang}|${record.timeZone}`, shared);
+    signal = await person.signal(view, signalExtra(view, record), shared);
   } catch (e) {
     if (e instanceof NotMember) {
       if (record.feed) await dropFeed(env, row.pid, now);

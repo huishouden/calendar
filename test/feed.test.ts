@@ -7,6 +7,9 @@ import { captureLogs } from '../src/log';
 import { apiRequest, drain, household, refreshFor, readDoc, refresh, resetFirestore, seed, world, writeDoc, type World } from './helpers/world';
 import { FEED_MAX_AGE_MS, type WorkOutcome } from '../src/work';
 
+/** An invented home in another zone than the person's device (Europe/Amsterdam). */
+const HOME = { address: '12 Example Lane, Springfield, Illinois 62701', lat: 39.7817, lng: -89.6501, timeZone: 'America/Chicago', setBy: 'alice@example.com', updatedAt: 1 };
+
 let w: World;
 
 beforeAll(async () => {
@@ -108,6 +111,24 @@ describe('the feed', () => {
     expect(ics).toContain('Amoxicillin');
     expect(summaries(ics)).toContain('Recogida de basura');
     expect(summaries(ics).some((s) => s.startsWith('Pendiente'))).toBe(false);
+  });
+
+  test("the household's home: Home events carry its address as LOCATION, and the feed keeps the home's zone", async () => {
+    const secret = await setUpFeed('helen@example.com');
+    const before = await (await get(secret)).text();
+    expect(before).not.toMatch(/^LOCATION/m);
+    expect(before).toContain('TZID=Europe/Amsterdam');
+    await writeDoc(`households/${household}`, { ...(await readDoc(`households/${household}`))!, home: HOME });
+    await refresh(w);
+    const ics = await (await get(secret)).text();
+    expect(icsProblems(ics)).toEqual([]);
+    const events = new ICAL.Component(ICAL.parse(ics)).getAllSubcomponents('vevent');
+    const where = Object.fromEntries(events.map((v) => [String(v.getFirstPropertyValue('summary')), v.getFirstPropertyValue('location')]));
+    expect(where['Garbage pickup']).toBe(HOME.address);
+    expect(where['Checkup']).toBeNull();
+    // The person's device said Amsterdam; the household lives in Chicago, so 07:00 is 07:00 there.
+    expect(ics).toContain('DTSTART;TZID=America/Chicago:20310904T070000');
+    expect(ics).not.toContain('TZID=Europe/Amsterdam');
   });
 
   test('unchanged: served again with its ETag, 304 when the client has it; a change rebuilds it', async () => {
