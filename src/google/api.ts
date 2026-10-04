@@ -1,4 +1,4 @@
-import type { Fetch } from '../env';
+import { globalFetch, type Fetch } from '../env';
 
 /**
  * The Google Calendar API calls the sync makes, with one access token. Writes go in batches of up
@@ -65,7 +65,7 @@ export class Calendar {
 
   constructor(
     private readonly token: string,
-    private readonly fetchImpl: Fetch = fetch,
+    private readonly fetchImpl: Fetch = globalFetch,
   ) {}
 
   private async call<T>(method: string, path: string, body?: unknown): Promise<{ status: number; body: T }> {

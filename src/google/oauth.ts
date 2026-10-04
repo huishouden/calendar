@@ -1,5 +1,5 @@
 import { sha256 } from '../b64';
-import type { Env, Fetch } from '../env';
+import { globalFetch, type Env, type Fetch } from '../env';
 
 /**
  * Google OAuth for the Calendar sync. The portal asks Google for a one-time code (Google Identity
@@ -72,7 +72,7 @@ export interface Granted {
 }
 
 /** The code from the portal's popup, exchanged for tokens. `postmessage` is the popup flow's redirect. */
-export async function exchangeCode(env: Env, code: string, fetchImpl: Fetch = fetch, now = Date.now()): Promise<Granted> {
+export async function exchangeCode(env: Env, code: string, fetchImpl: Fetch = globalFetch, now = Date.now()): Promise<Granted> {
   if (!env.GOOGLE_CLIENT_SECRET) throw new GoogleAuthError('config', 'Google Calendar sync is not set up on this server');
   const answer = await tokenCall(fetchImpl, { code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, redirect_uri: 'postmessage', grant_type: 'authorization_code' });
   const scope = answer.scope ?? '';
@@ -94,7 +94,7 @@ const access = new Map<string, { token: string; expiresAt: number }>();
 export const forgetAccess = () => access.clear();
 
 /** An access token for the refresh token: this isolate's while it lasts, otherwise a new one. */
-export async function accessToken(env: Env, refreshToken: string, fetchImpl: Fetch = fetch, now = Date.now()): Promise<string> {
+export async function accessToken(env: Env, refreshToken: string, fetchImpl: Fetch = globalFetch, now = Date.now()): Promise<string> {
   const key = await sha256(refreshToken);
   const hit = access.get(key);
   if (hit && hit.expiresAt - 5 * 60_000 > now) return hit.token;
@@ -106,7 +106,7 @@ export async function accessToken(env: Env, refreshToken: string, fetchImpl: Fet
 }
 
 /** Tells Google to forget the grant (disconnect). Failures are ignored: the token is dropped either way. */
-export async function revokeGoogle(refreshToken: string, fetchImpl: Fetch = fetch): Promise<void> {
+export async function revokeGoogle(refreshToken: string, fetchImpl: Fetch = globalFetch): Promise<void> {
   await fetchImpl(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(refreshToken)}`, { method: 'POST' }).catch(() => undefined);
   access.delete(await sha256(refreshToken));
 }
