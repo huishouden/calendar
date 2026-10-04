@@ -132,6 +132,14 @@ describe('the API', () => {
     expect(ok.headers.get('Access-Control-Allow-Origin')).toBe('https://site.example');
   });
 
+  test('Firestore over its quota or down is 503 unavailable, not "not a member"', async () => {
+    const exhausted = async (url: string, init?: RequestInit) =>
+      url.includes('/documents/households/') ? Response.json({ error: { code: 429, message: 'Quota exceeded.', status: 'RESOURCE_EXHAUSTED' } }, { status: 429 }) : w.fetch(url, init);
+    const res = await handleApi(w.env, apiRequest(`/api/status?household=${household}`, 'alice@example.com'), undefined, { fetch: exhausted, now: w.clock.now });
+    expect(res.status).toBe(503);
+    expect((await res.json()) as unknown).toEqual({ error: 'unavailable' });
+  });
+
   test('a refresh token must be the caller’s own', async () => {
     const res = await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('bob@example.com'), lang: 'en', timeZone: 'Europe/Amsterdam' });
     expect(res.status).toBe(400);
