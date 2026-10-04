@@ -64,6 +64,24 @@ describe('connecting', () => {
     expect(logs.lines.join('\n')).not.toMatch(/example\.com|bad-code|h1/);
   });
 
+  test('with the runtime’s own fetch (none passed in), which refuses to be called as a method, as Workers’ does', async () => {
+    const real = globalThis.fetch;
+    const faked = new Set(['oauth2.googleapis.com', 'www.googleapis.com', 'securetoken.googleapis.com', 'identitytoolkit.googleapis.com']);
+    globalThis.fetch = function (this: unknown, url: string | URL | Request, init?: RequestInit) {
+      if (this !== undefined && this !== globalThis) throw new TypeError('Illegal invocation: function called with incorrect `this` reference');
+      const u = String(url);
+      return faked.has(new URL(u).hostname) ? w.fetch(u, init) : real(u, init);
+    } as typeof fetch;
+    try {
+      const res = await handleApi(w.env, apiRequest('/api/google/connect', 'alice@example.com', { household, code: 'good-code', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ }), undefined, { now: w.clock.now });
+      expect(res.status).toBe(200);
+      const calendarId = (await loadPerson(w.env, await personId(household, 'alice@example.com')))!.google!.calendarId;
+      expect(w.google.cal(calendarId).summary).toBe('Huishouden');
+    } finally {
+      globalThis.fetch = real;
+    }
+  });
+
   test('Google’s code without calendar access is refused, and nothing is kept', async () => {
     const res = await call('/api/google/connect', 'alice@example.com', { household, code: 'no-calendar', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
     expect(res.status).toBe(400);

@@ -22,3 +22,9 @@ export interface Env {
 
 /** `fetch`, or a stand-in in tests. */
 export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The runtime's `fetch`, called unbound. Workers throws `TypeError: Illegal invocation` when `fetch`
+ * is called as a method (`this.fetchImpl(...)`), so it is never stored bare as a default.
+ */
+export const globalFetch: Fetch = (url, init) => fetch(url, init);
