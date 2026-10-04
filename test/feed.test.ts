@@ -113,7 +113,12 @@ describe('the feed', () => {
     await setUpFeed('alice@example.com');
     expect((await get('x'.repeat(32))).status).toBe(404);
     const stored = [...w.env.TOKENS.map.entries()].map(([k, v]) => `${k} ${v}`).join('\n');
-    expect(stored).not.toMatch(/rt:|alice|example\.com|h1/);
+    // Base64url never has '@', '"', '#' or ':' after the key's prefix: any of them would be plain text.
+    for (const [k, v] of w.env.TOKENS.map) {
+      expect(k).toMatch(/^(feed|person):[A-Za-z0-9_-]+$/);
+      expect(v).toMatch(/^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    }
+    expect(stored).not.toMatch(/@|"|#/);
   });
 });
 
