@@ -22,6 +22,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: huishouden/pwa-kit/actions/leak-scan@v0
+      - uses: huishouden/pwa-kit/actions/license-check@v0 # PolyForm Shield 1.0.0 (pwa-kit STANDARD.md "License")
 
   # The sync and the feed run against the Firestore emulator with the household's real rules
   # (huishouden/rules main), with Google and Firebase Auth faked.
