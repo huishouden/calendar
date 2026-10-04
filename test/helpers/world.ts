@@ -4,6 +4,8 @@ import { decodeFields, encodeFields } from '@huishouden/pwa-kit/firestore-rest';
 import type { Env } from '../../src/env';
 import { forgetTokens } from '../../src/person';
 import { forgetAccess } from '../../src/google/oauth';
+import { checkPeople } from '../../src/check';
+import { runWork, type WorkMessage } from '../../src/work';
 import { FakeGoogle } from './google';
 import { memoryD1, memoryKV } from './d1';
 import fixture from '../fixtures/household.json';
@@ -91,6 +93,10 @@ export async function writeDoc(path: string, data: Record<string, unknown>): Pro
 
 export interface World {
   env: Env & { TOKENS: KVNamespace & { map: Map<string, string> } };
+  /** Messages on the work queue, oldest first; `drain` runs them. */
+  queue: WorkMessage[];
+  /** When set, the queue refuses messages (the free plan's daily operations used up). */
+  queueFull: { on: boolean };
   google: FakeGoogle;
   fetch: (url: string, init?: RequestInit) => Promise<Response>;
   clock: { now: number };
@@ -138,7 +144,39 @@ export function world(): World {
     }
     return fetch(url, init);
   };
-  return { env, google, fetch: fakeFetch, clock, authCalls };
+  const queue: WorkMessage[] = [];
+  const queueFull = { on: false };
+  env.WORK = {
+    send: async (m: WorkMessage) => {
+      if (queueFull.on) throw new Error('Queue operations limit exceeded');
+      queue.push(m);
+    },
+  } as unknown as Queue<WorkMessage>;
+  // The Fanout entrypoint, called in place (Cloudflare runs each call as its own invocation).
+  env.SELF = {
+    check: (pids) => checkPeople(env, pids, { fetch: fakeFetch, now: clock.now }),
+    work: (pid) => runWork(env, pid, { fetch: fakeFetch, now: clock.now, next: (p) => env.SELF!.work(p) }),
+  };
+  return { env, google, fetch: fakeFetch, clock, authCalls, queue, queueFull };
+}
+
+/** Runs the queue until it is empty, as the consumer does: one unit per message. Returns how many ran. */
+export async function drain(w: World): Promise<number> {
+  let n = 0;
+  while (w.queue.length) {
+    const m = w.queue.shift()!;
+    n++;
+    const outcome = await runWork(w.env, m.pid, { fetch: w.fetch, now: w.clock.now, next: (p) => w.env.SELF!.work(p) });
+    if ('retryAfter' in outcome && n > 50) throw new Error('the queue keeps retrying');
+  }
+  return n;
+}
+
+/** Everyone checked now (as the cron's checks would, whatever their slot), then their work run. */
+export async function refresh(w: World): Promise<void> {
+  const { results } = await w.env.DB.prepare('SELECT pid FROM people').all<{ pid: string }>();
+  await checkPeople(w.env, results.map((r) => r.pid), { fetch: w.fetch, now: w.clock.now });
+  await drain(w);
 }
 
 /** A request to the Worker's API as `email`, from the site. */

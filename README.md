@@ -32,14 +32,18 @@ events:
 
 | File | Does |
 |---|---|
-| `src/index.ts` | Routes: `/feed/<secret>.ics`, `/api/*`, and the 5-minute cron |
-| `src/feed.ts` | The feed: the person's calendar, cached in D1 while nothing changed, `ETag`/304 |
+| `src/index.ts` | Routes: `/feed/<secret>.ics`, `/api/*`, the cron (every minute), the queue, and `Fanout` (the entrypoint the Worker calls itself through) |
+| `src/feed.ts` | The feed: the precomputed calendar from D1, `ETag`/304. Never builds one |
 | `src/api.ts` | The portal's calls: status, set up / rotate / revoke the feed, connect / sync / disconnect Google |
+| `src/tick.ts` | The cron: who is due this minute, checked a few at a time in their own invocations |
+| `src/check.ts` | The cheap check for a few people: did anything they see change? Marks and queues the work |
+| `src/work.ts` | One unit of a person's work per invocation: build their feed, or one round of their sync. Lease, back-off |
 | `src/person.ts` | Acting as the person: their ID token on every Firestore call, their role and settings, the change signal |
-| `src/sync.ts` | One person's Google sync: Google's changes, the household's, the writes in batches; the cron |
+| `src/sync.ts` | One round of a person's Google sync: Google's changes, the household's, the writes in a batch |
+| `src/warm.ts` | Run at startup: a small export, so a build in a fresh isolate doesn't pay for first use |
 | `src/backsync.ts` | A change made in Google read as an edit and applied to the record as the person |
 | `src/google/*` | OAuth (code exchange, refresh, revoke), the Calendar API with batching, event bodies and ids |
-| `src/store.ts`, `src/seal.ts` | Sealed records in KV, sync state in D1 |
+| `src/store.ts`, `src/seal.ts` | Sealed records and feeds in D1, feed secrets' owners in KV, sync state in D1 |
 
 ### Signing in as the person
 
@@ -51,41 +55,52 @@ Firestore over REST with them (`/firestore-rest`). This is the same way huishoud
 
 ### What is kept, and where
 
-- **KV** holds two kinds of sealed record (AES-256-GCM, key derived with HKDF from the `SEAL_KEY`
-  secret and the record's purpose):
-  - the person's record: their refresh token, feed secret, Google refresh token and calendar id,
-    language and time zone;
-  - per feed secret, whose it is. This record is sealed with a key that also needs the secret from
-    the URL, so the Worker's key alone can't open it.
+Records are sealed with AES-256-GCM, the key derived with HKDF from the `SEAL_KEY` secret and the
+record's purpose.
 
-  KV keys are hashes. Nothing in KV is readable without the secrets.
-- **D1** holds the sync state, keyed by a hash of household and email:
-  - which Google event stands for which agenda key;
-  - the hash and a snapshot of what was written;
-  - the etag our own write got back;
-  - Google's sync token;
-  - the last feed, served again while nothing changed.
+- **D1** holds, keyed by `pid` (a hash of household and email):
+  - the person's sealed record: their refresh token, feed secret, Google refresh token and calendar
+    id, language and time zone (KV held it before; a record still there moves to D1 when first read);
+  - their **precomputed feed**, keyed by a hash of the feed secret and sealed with a key that also
+    needs the secret from the URL, so the Worker's key alone can't open it;
+  - the sync state: which Google event stands for which agenda key, the hash and a snapshot of what
+    was written, the etag our own write got back, Google's sync token;
+  - the work a check found, the lease of the unit working on it, and Google's back-off.
+- **KV** holds, per feed secret, whose it is, sealed the same way as the feed. KV keys are hashes.
+
+Nothing in D1 or KV is readable without the secrets.
 - **Firestore** holds what the person chose (`calendarSettings/{email}`) and the history of changes
   from Google (`calendarChanges`), both readable only by that person. Tokens never go there.
 
 ### The feed
 
-`GET /feed/<secret>.ics` (also `HEAD`). The secret finds the person, and the feed is worked out as
-them. Before reading the agenda, the Worker asks Firestore for a **change signal**: for the agenda,
-personal agenda, to-dos and personal to-dos, a count and a sum of `updatedAt` in one aggregation each.
-Together with the person's role and settings, this tells whether anything they see changed.
+`GET /feed/<secret>.ics` (also `HEAD`) serves the feed stored for that URL, with its `ETag`, or a
+304 to a client that sent it. It costs a hash, one D1 read and an AES-GCM open. **A request never
+builds a feed** and never asks Firestore. The feed is built ahead of time, as the person, whenever
+what they see changes (see "Many households" below):
 
-- **Nothing changed**: the last feed comes back from D1 with the same `ETag`, or a 304 to a client
-  that sent it.
-- **Something changed**: the agenda is read and the feed is built again.
+- **set up or rotated** in the portal: built before the portal shows the link, in its own
+  invocation (rotating seals the same calendar again for the new URL);
+- **something they see changed** (an item, their role, their settings): the next check notices
+  through the **change signal**, and the work builds it within seconds. The signal is a count and a
+  sum of `updatedAt` for the agenda, personal agenda, to-dos and personal to-dos, one aggregation
+  each, plus the person's role and settings;
+- **each request** for a feed-only person asks for a check of them (its own invocation, after the
+  answer, at most every 5 seconds), so a change made in the portal reaches the calendar app at its
+  next fetch;
+- **older than a day**: the request marks it stale, and the next check builds it again anyway.
+
+A feed with nothing stored yet (made before this design, or its build failed) is built in its own
+invocation while the request waits. If that fails too, the answer is 503 with `Retry-After: 60`.
 
 The feed asks to be refreshed hourly (`REFRESH-INTERVAL`, `X-PUBLISHED-TTL`: PT1H). If the
-household can't be reached, the last feed is served rather than an empty calendar. Someone who
-left the household gets a 404, and their feed is deleted.
+household can't be reached, the stored feed stays rather than an empty calendar. Someone who left
+the household gets a 404, and their feed is deleted.
 
 ### Google Calendar sync, both ways
 
-Each run, for one person:
+A check every 5 minutes (below) asks Google's change list and the change signal. When either moved,
+a round of the sync runs for the person:
 
 1. **Google's changes.** `events.list` with the stored sync token returns what changed in the
    Huishouden calendar, deletions included. A change whose etag is the one our own write got back
@@ -118,7 +133,8 @@ Each run, for one person:
    **Conflicts: last writer wins.** If the agenda item was updated after Google's change (its
    `updatedAt` against the event's `updated`), the app's version stands and is written to Google
    again.
-4. **The difference goes to Google**, up to 50 writes in each batch request:
+4. **The difference goes to Google**, up to 50 writes in a batch request per round. More than that
+   (a first sync) goes in the next round, at once:
    - new events are inserted with ids made from the person and the key, so a retry can't make
      two;
    - changed events are rewritten (whole, recurrence included);
@@ -128,8 +144,93 @@ Each run, for one person:
    Each event carries the private property `huishouden` (`'<household>:<key>'`). The kit's calendar
    import skips such events, so nothing exported comes back as a suggestion.
 
-A full rebuild happens at least every 6 hours anyway. Each run logs one line of counts. Logs never
+A full rebuild happens at least every 6 hours anyway. Each round logs one line of counts. Logs never
 hold titles, emails, households or tokens.
+
+## Many households
+
+Everything runs on Cloudflare's free plan, for any number of households up to about 1,000 people.
+The limits that shape it:
+
+| Free plan | Limit |
+|---|---|
+| CPU per invocation (request, cron, queue message) | 10 ms |
+| Subrequests per invocation | 50 (1,000 to Cloudflare services) |
+| Invocations a request may start through service bindings | 32 |
+| Workers requests | 100,000 a day |
+| Queues | 10,000 operations a day (3 per message: write, read, delete) |
+| KV | 100,000 reads, 1,000 writes a day |
+| D1 | 5 million rows read, 100,000 rows written a day; 5 GB |
+| Cron Triggers | 5 per account (this Worker uses one per environment) |
+
+### How the work is split
+
+1. **The cron, every minute** (`src/tick.ts`). Each person has a fixed slot (a number 0..59 from
+   their `pid`). People with Google are checked every 5 minutes, people with only a feed every 15
+   (calendar apps fetch hourly at most). The people due this minute go out in chunks of 8, a
+   household's members together, each chunk to **its own invocation** of this Worker:
+   `env.SELF.check(pids)`, a service binding to the Worker's own `Fanout` entrypoint. Each
+   invocation has its own 10 ms and 50 subrequests. The cron starts at most 30 (Cloudflare allows
+   32 per request).
+2. **The check** (`src/check.ts`), per person: Google's change list with the sync token (our own
+   writes coming back move the token on, nothing more), then the change signal. The household and
+   the person's settings come in one `batchGet`. The household's shared lists are read once for all
+   its members in the chunk: the count and sum are the same query whoever asks, and only go into
+   each member's own signal. **When nothing changed, nothing is written**: no D1 row, no queue
+   message. A chunk stops before its 50 subrequests, and the cron gives the rest to another
+   invocation.
+3. **The work** (`src/work.ts`): a check that finds a change marks it in D1 and sends **one queue
+   message for the person** (never a second while one is on its way). The consumer takes one
+   message per invocation (`max_batch_size = 1`). It does **one unit**: one round of the sync (up to
+   50 writes), or building the feed. The next unit, the other kind or more writes, is its own
+   invocation (`env.SELF.work`), straight away.
+   - **Per-person order**: a unit holds the person's lease in D1. A second unit for them waits
+     (the message comes back in 30 seconds), and the checks skip them meanwhile. Units work from what
+     Firestore and Google say at the time, so their order can't undo anything.
+   - **Back-off**: Google's 429, or a 403 whose reason is a rate limit (`rateLimitExceeded`,
+     `userRateLimitExceeded`, `quotaExceeded`), backs the person off, from 30 seconds doubling to an
+     hour. Nothing is asked of Google for them until then, and the message comes back after it. A 403
+     for access is an error, not a back-off.
+   - **When the queue says no** (its 10,000 daily operations used up): the work stays marked, and
+     the cron runs it from its spare invocations. A message lost after 3 retries goes the same way
+     after 10 minutes.
+4. **Firestore's own quota**: a project on the free (Spark) plan has 50,000 reads a day for
+   everything, the apps included. Once they are used up, every read fails until midnight Pacific
+   time: the apps' too. `FIRESTORE_CHECK_READS` (`wrangler.toml`) is the share the checks may use,
+   at about 5 reads a check. Once an hour, the cron works out how often it can check everyone within
+   it (every 5, 10, 15, 20, 30 or 60 minutes) and checks less often rather than go over it. When
+   Firestore answers 429 anyway, the checks stop for 15 minutes.
+
+### What 1,000 people cost a day
+
+The worst case: 1,000 people, each with Google sync and a subscribed feed that their calendar app
+fetches hourly, and 3 changes a day that each of them sees (changes within a 5-minute check count
+once).
+
+| Resource | Arithmetic | A day | Free plan |
+|---|---|---|---|
+| Workers requests | cron 1,440 + checks 1,000 × 288 ÷ 8 = 36,000 + feed fetches 1,000 × 24 = 24,000 + sync units 3,000 + feed units 3,000 + portal ~500 | **~68,000** | 100,000 |
+| (all feed-only instead) | cron 1,440 + checks 1,000 × 96 ÷ 8 = 12,000 + fetches 24,000 + checks asked by fetches 24,000 + feed units 3,000 + portal ~500 | ~65,000 | 100,000 |
+| Invocations per cron run | 1,000 × 12 slots ÷ 60 minutes = 200 people a minute ÷ 8 | 25 | 32 |
+| Subrequests per check invocation | 8 people × ~5 (change list, `batchGet`, 2 aggregations, a token now and then) + the household's 2 shared aggregations | ~45 | 50 |
+| Queue operations | 3,000 messages × 3 | **9,000** | 10,000 (more runs from the cron) |
+| D1 rows written | per change ~15 (mark, lease, person, ~2 events, release, feed; indexes included) × 3,000 = 45,000 + token after echoes 3,000 + ticks 1,440 + stale feeds 5,000 | **~55,000** | 100,000 |
+| D1 rows read | cron 200 a minute × 1,440 = 288,000 + checks 288,000 + feed rows 288,000 + events read on echoes ~150,000 + syncs ~160,000 + fetches 24,000 | ~1.2 million | 5 million |
+| D1 storage | feeds ~40 KB sealed + ~50 events × ~1 KB, per person | ~90 MB | 5 GB |
+| KV | reads: none on the request path (only a feed with nothing stored); writes: one per feed set up or rotated | ~0 / ~10 | 100,000 / 1,000 |
+
+**Why the feeds are in D1, not KV:** 3,000 rebuilds a day (and 6,000 at 6 changes a day) would be
+3 to 6 times KV's 1,000 writes a day, while D1 allows 100,000 rows written. The Cache API is per
+data centre and can be evicted at any time, so a feed there would still need rebuilding in requests.
+
+**Firestore is the limit that bites first.** The checks cost about 5 reads each: 1,000 people every 5
+minutes is ~1.4 million reads a day, against 50,000 a day on the free Spark plan for everything. With
+`FIRESTORE_CHECK_READS = 20000` (40% of it), Spark keeps 5-minute checks for about 13 people with
+Google (20,000 ÷ (288 × 5)) or 40 with only a feed. Past that, the checks space out on their own,
+down to hourly. 1,000 people within 5 minutes of a change needs the project on Blaze: ~1.4 million
+reads a day is $0.40 to $0.80 a day after the free 50,000 ($0.03 to $0.06 per 100,000 reads,
+by the database's location). Then raise or unset
+`FIRESTORE_CHECK_READS`.
 
 ## Limits
 
@@ -137,24 +238,19 @@ hold titles, emails, households or tokens.
   own schedule, typically every 8 to 24 hours, and ignores `REFRESH-INTERVAL`. Apple Calendar
   follows the hourly hint (or its own setting); Outlook refreshes on its own schedule, every few hours. For Google, use
   the sync, which shows changes within about 5 minutes.
-- **The sync runs every 5 minutes**, for about 3 people per run (the free plan's 50 subrequests).
-  Each person costs about 12 requests: a token, the change list, four aggregations, two reads and
-  the batches. People are taken longest-unsynced first, so with more people each waits a few runs.
-  A busy run writes at most 200 events per person, and the rest go next run.
-- **Firestore's free tier**: a check costs about 6 reads per person per run when nothing changed,
-  about 1,700 a day each. A rebuild reads the person's agenda, a few hundred documents.
-  When the project's daily quota is used up (Spark: 50,000 reads), Firestore answers 429 until
-  midnight Pacific time: the portal's calls get 503 `firestore-quota` (the portal says so, rather than "couldn't reach") and
-  feeds serve their last copy.
-- **CPU**: measured on staging with about 50 events:
-  - a feed rebuild takes 28 to 53 ms of CPU time;
-  - a feed served from the cache, 8 ms;
-  - a portal API call, 3 to 21 ms.
-
-  Cloudflare reported each of these as `ok`. If the account's plan enforces a 10 ms per-request
-  limit, a rebuild could be refused with error 1102. The calendar app would then retry later and
-  get the cached feed once one exists. Most of the cost is the cold start: the zone data for the
-  VTIMEZONE and the language catalogue load.
+- **A change reaches Google within 5 minutes**, plus a few seconds for the work: the check that
+  notices it runs every 5 minutes (longer only when Firestore's read budget asks, see "Many
+  households"), and the work runs within seconds of it.
+- **Firestore's free tier**: a check costs about 5 reads. A feed build or a sync round reads the
+  person's agenda, a few hundred documents. When the project's daily quota is used up (Spark: 50,000
+  reads), Firestore answers 429 until midnight Pacific time: the portal's calls get 503
+  `firestore-quota` (the portal says so, rather than "couldn't reach"), feeds serve what is stored,
+  and the checks pause.
+- **CPU**: every invocation stays within the free plan's 10 ms. A request serves what is stored. A
+  check is a few small reads per person. A build or a sync round is one person's calendar in its own
+  invocation, and the cold start (language catalogues, the runtime's time zone data, compiling the
+  export) happens once per isolate at startup (`src/warm.ts`), which Cloudflare limits separately.
+  Measured on staging: see "CPU, measured" below.
 - **Ahead of the window**: apps publish 180 days ahead (Home's regular events 60). A repeating event
   carries on past that by its schedule. A skip or move further ahead shows once it is within the
   app's window.
@@ -170,6 +266,11 @@ hold titles, emails, households or tokens.
   - If it is sensitive, an unverified app shows a warning screen and is limited to 100 users until
     Google verifies it. Verification is free and needs a privacy policy and a short video.
 
+### CPU, measured
+
+Staging, `wrangler tail` (each invocation's `cpuTime`): to follow, once staging's Firestore quota is
+back.
+
 ## One-time setup
 
 All of it is done once for the whole suite, never per household.
@@ -179,6 +280,7 @@ bun install
 # Storage (the ids are in wrangler.toml).
 bunx wrangler d1 create huishouden-calendar
 bunx wrangler kv namespace create huishouden-calendar
+bunx wrangler queues create huishouden-calendar-work            # and huishouden-calendar-work-staging
 bun run deploy:staging && bun run deploy   # applies D1 migrations, then deploys
 ```
 
@@ -233,7 +335,7 @@ The portal calls this Worker at `VITE_CALENDAR_URL` (production) and `STAGING_VI
 ```sh
 bun run deploy:staging      # huishouden-calendar-staging, the huishouden-staging project
 bun run deploy              # production
-bunx wrangler tail          # one line of counts per run and per request
+bunx wrangler tail          # one line per request, check run, unit of work and tick, with each invocation's cpuTime
 ```
 
 CI deploys staging, then production, on every push to `main` once the organisation secrets

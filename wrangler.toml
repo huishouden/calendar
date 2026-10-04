@@ -7,23 +7,45 @@ compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
+# Every minute: the people due in this minute's slot are checked (src/tick.ts). Still one Cron
+# Trigger (the free plan allows 5 per account).
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
 
 [observability]
 enabled = true
 
-# Feed secrets' records and each person's tokens, sealed (AES-GCM, src/seal.ts).
+# Feed secrets' records, sealed (AES-GCM, src/seal.ts). (Person records made before the scale-out
+# too, until first read: they move to D1.)
 [[kv_namespaces]]
 binding = "TOKENS"
 id = "5109659c2f0e4309b8921833001e5cc8"
 
-# Sync state: which Google event stands for which agenda item, hashes, sync tokens, the last feed.
+# Each person's sealed record, sync state (which Google event stands for which agenda item, hashes,
+# sync tokens), the precomputed feeds (sealed), the work marks.
 [[d1_databases]]
 binding = "DB"
 database_name = "huishouden-calendar"
 database_id = "ddce9c93-4af7-4e42-84fc-6bf68389968c"
 migrations_dir = "migrations"
+
+# The work queue: one message per person with work (src/work.ts). One message per invocation, so
+# each unit has the free plan's 10 ms of CPU to itself.
+[[queues.producers]]
+binding = "WORK"
+queue = "huishouden-calendar-work"
+
+[[queues.consumers]]
+queue = "huishouden-calendar-work"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+
+# This Worker's own Fanout entrypoint: each check and each unit of work is its own invocation.
+[[services]]
+binding = "SELF"
+service = "huishouden-calendar"
+entrypoint = "Fanout"
 
 # Public values. Secrets are set with `bunx wrangler secret put`, never written here:
 #   SEAL_KEY              32 random bytes, base64 (`bun run seal-key`): seals tokens in KV
@@ -38,13 +60,31 @@ GOOGLE_CLIENT_ID = "865471112898-s88n43rlk8m2iv200lmejmj5k4rrb2sh.apps.googleuse
 SITE_URL = "https://huishouden-piekstra.web.app"
 ALLOWED_ORIGINS = "https://huishouden-piekstra.web.app"
 CALENDAR_NAME = "Huishouden"
+# Firestore reads a day the checks may use, of the free plan's 50,000 shared with every app
+# (README, "Many households"). They check less often rather than go over it.
+FIRESTORE_CHECK_READS = "20000"
 
 [env.staging]
 name = "huishouden-calendar-staging"
 workers_dev = true
 
 [env.staging.triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
+
+[[env.staging.queues.producers]]
+binding = "WORK"
+queue = "huishouden-calendar-work-staging"
+
+[[env.staging.queues.consumers]]
+queue = "huishouden-calendar-work-staging"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+
+[[env.staging.services]]
+binding = "SELF"
+service = "huishouden-calendar-staging"
+entrypoint = "Fanout"
 
 [[env.staging.kv_namespaces]]
 binding = "TOKENS"
@@ -62,3 +102,5 @@ GOOGLE_CLIENT_ID = "212329703141-k8rtusehnq9a7c7okd3e6c8md99u7gj2.apps.googleuse
 SITE_URL = "https://huishouden-staging.web.app"
 ALLOWED_ORIGINS = "https://huishouden-staging.web.app http://localhost:5173 http://127.0.0.1:5173"
 CALENDAR_NAME = "Huishouden (staging)"
+# Staging's reads mostly go to the apps' CI.
+FIRESTORE_CHECK_READS = "5000"
