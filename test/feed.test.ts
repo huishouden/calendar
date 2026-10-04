@@ -132,12 +132,16 @@ describe('the API', () => {
     expect(ok.headers.get('Access-Control-Allow-Origin')).toBe('https://site.example');
   });
 
-  test('Firestore over its quota or down is 503 unavailable, not "not a member"', async () => {
+  test('Firestore over its daily quota is 503 firestore-quota, not "not a member"; down is 503 unavailable', async () => {
     const exhausted = async (url: string, init?: RequestInit) =>
       url.includes('/documents/households/') ? Response.json({ error: { code: 429, message: 'Quota exceeded.', status: 'RESOURCE_EXHAUSTED' } }, { status: 429 }) : w.fetch(url, init);
     const res = await handleApi(w.env, apiRequest(`/api/status?household=${household}`, 'alice@example.com'), undefined, { fetch: exhausted, now: w.clock.now });
     expect(res.status).toBe(503);
-    expect((await res.json()) as unknown).toEqual({ error: 'unavailable' });
+    expect((await res.json()) as unknown).toEqual({ error: 'firestore-quota' });
+    const down = async (url: string, init?: RequestInit) => (url.includes('/documents/households/') ? Response.json({ error: { code: 503, status: 'UNAVAILABLE' } }, { status: 503 }) : w.fetch(url, init));
+    const res2 = await handleApi(w.env, apiRequest(`/api/status?household=${household}`, 'alice@example.com'), undefined, { fetch: down, now: w.clock.now });
+    expect(res2.status).toBe(503);
+    expect((await res2.json()) as unknown).toEqual({ error: 'unavailable' });
   });
 
   test('a refresh token must be the caller’s own', async () => {
