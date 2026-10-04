@@ -101,7 +101,8 @@ async function checkOne(env: Env, row: PersonRow, deps: CheckDeps & { fetch: Fet
   const record = await openPerson(env, row.pid, row.record);
   if (!record) return 0;
   let kinds = row.work & (FEED | SYNC);
-  const google = row.google === 1 && record.google ? record.google : null;
+  // Google access removed and recorded: nothing to sync until they connect again (which clears it).
+  const google = row.google === 1 && record.google && row.last_error !== 'google-revoked' ? record.google : null;
 
   // Google's side first: a change there is work whatever the household did.
   if (google && !(kinds & SYNC)) {
@@ -109,7 +110,7 @@ async function checkOne(env: Env, row: PersonRow, deps: CheckDeps & { fetch: Fet
     try {
       calendar = new Calendar(await accessToken(env, google.refreshToken, deps.fetch, now), deps.fetch);
     } catch (e) {
-      // Revoked: the sync records it. Google unreachable: the next check tries again.
+      // Revoked: the sync records it (once: see `google` above). Google unreachable: the next check tries again.
       if (e instanceof GoogleAuthError && e.kind === 'revoked') kinds |= SYNC;
     }
     if (calendar) {
