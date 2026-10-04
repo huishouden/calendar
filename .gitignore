@@ -5,3 +5,6 @@ dist/
 *.key.json
 .rules-repo/
 firestore-debug.log
+.env
+.env.local
+.env*.local
