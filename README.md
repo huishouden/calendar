@@ -144,7 +144,8 @@ hold titles, emails, households or tokens.
 - **Firestore's free tier**: a check costs about 6 reads per person per run when nothing changed,
   about 1,700 a day each. A rebuild reads the person's agenda, a few hundred documents.
   When the project's daily quota is used up (Spark: 50,000 reads), Firestore answers 429 until
-  midnight Pacific time: the portal's calls get 503 `unavailable` and feeds serve their last copy.
+  midnight Pacific time: the portal's calls get 503 `firestore-quota` (the portal says so, rather than "couldn't reach") and
+  feeds serve their last copy.
 - **CPU**: measured on staging with about 50 events:
   - a feed rebuild takes 28 to 53 ms of CPU time;
   - a feed served from the cache, 8 ms;

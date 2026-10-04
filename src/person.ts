@@ -153,5 +153,8 @@ export class Person {
   }
 }
 
+/** Firestore said the project's daily quota is used up (429 RESOURCE_EXHAUSTED; Spark resets at midnight Pacific). */
+export const overQuota = (e: unknown): boolean => e instanceof FirestoreError && /\b429\b|RESOURCE_EXHAUSTED/.test(e.message);
+
 /** Whether an error means the person's sign-in is gone for good (signed out everywhere, account disabled). */
 export const signInGone = (e: unknown): boolean => e instanceof FirebaseAuthError && e.kind === 'revoked';

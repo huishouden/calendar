@@ -2,7 +2,7 @@ import { contentHash, exportEvents, exportIcs, loadExportLang } from '@huishoude
 import { icsProblems } from '@huishouden/pwa-kit/ics';
 import type { Env, Fetch } from './env';
 import { log } from './log';
-import { NotMember, Person, signInGone } from './person';
+import { NotMember, overQuota, Person, signInGone } from './person';
 import { feedOwner, loadPerson, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
 
 /**
@@ -78,7 +78,7 @@ export async function serveFeed(env: Env, request: Request, secret: string, { no
     if (signInGone(e)) {
       await savePerson(env, pid, { ...record, signedOut: true });
       log('feed', { served: last ? 'stale' : 'none', reason: 'signed-out' });
-    } else log('feed', { served: last ? 'stale' : 'none', reason: 'error' });
+    } else log('feed', { served: last ? 'stale' : 'none', reason: overQuota(e) ? 'firestore-quota' : 'error' });
     // Keep the calendar as it was rather than emptying it; it updates once things work again.
     if (last) return respond(request, last.body, last.etag);
     return new Response('The calendar is not available right now. Try again later.\n', { status: 503, headers: { 'Retry-After': '600', 'Content-Type': 'text/plain; charset=utf-8' } });

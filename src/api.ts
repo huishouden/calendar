@@ -5,7 +5,7 @@ import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
 import type { Env, Fetch } from './env';
 import { feedUrl } from './feed';
 import { log } from './log';
-import { authOptions } from './person';
+import { authOptions, overQuota } from './person';
 import { Calendar } from './google/api';
 import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, revokeGoogle } from './google/oauth';
 import { deletePerson, deletePersonRows, loadPerson, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
@@ -56,6 +56,9 @@ interface Caller {
 
 const HOUSEHOLD = /^[A-Za-z0-9_-]{1,128}$/;
 
+/** 503, saying which: `firestore-quota` (back after the daily reset; retrying sooner only uses requests) or `unavailable`. */
+const unavailable = (e: unknown) => new HttpError(503, overQuota(e) ? 'firestore-quota' : 'unavailable');
+
 async function caller(env: Env, request: Request, household: string | null, fetchImpl: Fetch | undefined, firestoreUrl?: string): Promise<Caller> {
   const idToken = /^Bearer (.+)$/.exec(request.headers.get('Authorization') ?? '')?.[1];
   if (!idToken) throw new HttpError(401, 'sign-in');
@@ -73,7 +76,7 @@ async function caller(env: Env, request: Request, household: string | null, fetc
   // Firestore's daily quota (429 RESOURCE_EXHAUSTED) or an outage, is the service being unavailable.
   const doc = await db.get(`households/${household}`).catch((e: unknown) => {
     if (e instanceof FirestoreError && (e.code === 'permission-denied' || e.code === 'not-found')) return null;
-    throw new HttpError(503, 'unavailable');
+    throw unavailable(e);
   });
   const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
   if (!members.includes(who.email)) throw new HttpError(403, 'not-member');
@@ -251,6 +254,10 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
     if (e instanceof HttpError) {
       log('api', { route: url.pathname, ok: false, status: e.status, code: e.code });
       return json(e.status, { error: e.code }, headers);
+    }
+    if (overQuota(e)) {
+      log('api', { route: url.pathname, ok: false, status: 503, code: 'firestore-quota' });
+      return json(503, { error: 'firestore-quota' }, { ...headers, 'Retry-After': '3600' });
     }
     log('api', { route: url.pathname, ok: false, status: 500 });
     return json(500, { error: 'server' }, headers);
