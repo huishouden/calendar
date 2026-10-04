@@ -274,6 +274,19 @@ describe('fan-out and the queue', () => {
     expect((await w.env.DB.prepare('SELECT backoff, backoff_until FROM people WHERE pid = ?').bind(pid).first<Record<string, unknown>>())).toEqual({ backoff: 0, backoff_until: null });
   });
 
+  test('Google access removed: one round records it, and the checks don’t queue it again', async () => {
+    const { pid } = await connect();
+    w.google.revoked.add('g-refresh-good-code');
+    const { forgetAccess } = await import('../src/google/oauth');
+    forgetAccess();
+    expect((await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now })).marked).toBe(1);
+    await drain(w);
+    expect((await w.env.DB.prepare('SELECT last_error FROM people WHERE pid = ?').bind(pid).first<{ last_error: string }>())!.last_error).toBe('google-revoked');
+    w.clock.now += 5 * MIN;
+    expect((await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now })).marked).toBe(0);
+    expect(w.queue).toEqual([]);
+  });
+
   test('a 403 for rate limits backs off too; a 403 for access does not', async () => {
     const { isRateLimited, CalendarApiError } = await import('../src/google/api');
     expect(isRateLimited(new CalendarApiError(403, 'x', 'userRateLimitExceeded'))).toBe(true);
