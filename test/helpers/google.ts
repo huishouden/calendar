@@ -112,14 +112,17 @@ export class FakeGoogle {
     if (p.get('grant_type') === 'authorization_code') {
       const code = p.get('code');
       if (code === 'bad-code') return json(400, { error: 'invalid_grant' });
-      const scope = code === 'no-calendar' ? 'openid email' : 'openid email https://www.googleapis.com/auth/calendar.app.created';
+      // Codes "gmail-<name>" are an alert inbox's account (test/helpers/gmail.ts); "gmail-denied" has Gmail unticked.
+      const gmail = code?.startsWith('gmail-');
+      const scope = code === 'no-calendar' || code === 'gmail-denied' ? 'openid email' : gmail ? 'https://www.googleapis.com/auth/gmail.readonly' : 'openid email https://www.googleapis.com/auth/calendar.app.created';
       const id = `${btoa(JSON.stringify({ alg: 'none' }))}.${btoa(JSON.stringify({ email: this.account })).replace(/=+$/, '')}.`;
-      return json(200, { access_token: 'g-access-1', refresh_token: `g-refresh-${code}`, expires_in: 3599, scope, id_token: id });
+      // An access token names its grant after "~", so the fake Gmail knows whose mailbox it is.
+      return json(200, { access_token: `g-access-1~g-refresh-${code}`, refresh_token: `g-refresh-${code}`, expires_in: 3599, scope, ...(gmail ? {} : { id_token: id }) });
     }
     if (p.get('grant_type') === 'refresh_token') {
       if (this.revoked.has(p.get('refresh_token') ?? '')) return json(400, { error: 'invalid_grant' });
       this.refreshCount++;
-      return json(200, { access_token: `g-access-${this.refreshCount + 1}`, expires_in: 3599, scope: 'https://www.googleapis.com/auth/calendar.app.created' });
+      return json(200, { access_token: `g-access-${this.refreshCount + 1}~${p.get('refresh_token')}`, expires_in: 3599, scope: 'https://www.googleapis.com/auth/calendar.app.created' });
     }
     return json(400, { error: 'unsupported_grant_type' });
   }

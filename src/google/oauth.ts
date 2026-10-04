@@ -2,16 +2,20 @@ import { sha256 } from '../b64';
 import { globalFetch, type Env, type Fetch } from '../env';
 
 /**
- * Google OAuth for the Calendar sync. The portal asks Google for a one-time code (Google Identity
- * Services' code client, the suite's own web client, popup mode); the Worker exchanges it here with
- * the client secret for a refresh token, which it keeps sealed (src/store.ts) and turns into access
- * tokens on each run.
+ * Google OAuth for the Calendar sync and Spending's alert inboxes. The app asks Google for a
+ * one-time code (Google Identity Services' code client, the suite's own web client, popup mode);
+ * the Worker exchanges it here with the client secret for a refresh token, which it keeps sealed
+ * (src/store.ts, src/mail/store.ts) and turns into access tokens on each run.
  *
- * Scope: `calendar.app.created` only. It lets the app create secondary calendars and manage them
- * and their events, and nothing else: no other calendar in the account is visible to it.
+ * Scopes:
+ * - Calendar: `calendar.app.created` only. It lets the app create secondary calendars and manage
+ *   them and their events, and nothing else: no other calendar in the account is visible to it.
+ * - Alert inbox: `gmail.readonly` (a restricted scope), used only to search the household's alert
+ *   words and labels and read the matching messages (src/mail/).
  */
 
 export const CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.app.created';
+export const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
 export const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 
 /** `revoked`: Google won't give tokens any more (access removed, password changed); `unavailable`: try later; `config`: no client secret. */
@@ -71,19 +75,19 @@ export interface Granted {
   account: string;
 }
 
-/** The code from the portal's popup, exchanged for tokens. `postmessage` is the popup flow's redirect. */
-export async function exchangeCode(env: Env, code: string, fetchImpl: Fetch = globalFetch, now = Date.now()): Promise<Granted> {
+/** The code from the app's popup, exchanged for tokens. `postmessage` is the popup flow's redirect. `scope` must have been granted. */
+export async function exchangeCode(env: Env, code: string, fetchImpl: Fetch = globalFetch, now = Date.now(), scope: string = CALENDAR_SCOPE): Promise<Granted> {
   if (!env.GOOGLE_CLIENT_SECRET) throw new GoogleAuthError('config', 'Google Calendar sync is not set up on this server');
   const answer = await tokenCall(fetchImpl, { code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, redirect_uri: 'postmessage', grant_type: 'authorization_code' });
-  const scope = answer.scope ?? '';
-  if (!scope.split(/\s+/).includes(CALENDAR_SCOPE)) throw new GoogleAuthError('denied', 'Calendar access was not allowed');
+  const granted = answer.scope ?? '';
+  if (!granted.split(/\s+/).includes(scope)) throw new GoogleAuthError('denied', scope === CALENDAR_SCOPE ? 'Calendar access was not allowed' : 'Gmail access was not allowed');
   if (!answer.refresh_token) throw new GoogleAuthError('denied', 'Google gave no lasting access; connect again');
   const id = claims(answer.id_token);
   return {
     refreshToken: answer.refresh_token,
     accessToken: answer.access_token!,
     expiresAt: now + (answer.expires_in ?? 3600) * 1000,
-    scope,
+    scope: granted,
     account: typeof id.email === 'string' ? id.email.toLowerCase() : '',
   };
 }

@@ -158,7 +158,7 @@ describe('keeping it in step', () => {
     // Each person exactly once in the five minutes, in its own invocation's chunk.
     expect(checked.flat().sort()).toEqual([a.pid, b.pid].sort());
     expect(totals.reduce((n, t) => n + t.marked, 0)).toBe(2);
-    expect(w.queue.map((m) => m.pid).sort()).toEqual([a.pid, b.pid].sort());
+    expect(w.queue.map((m) => ('pid' in m ? m.pid : m.inbox)).sort()).toEqual([a.pid, b.pid].sort());
     await drain(w);
     for (const p of [a, b]) expect(w.google.cal(p.calendarId).events.get((await ids(p.pid)).checkup)!.summary).toBe('Checkup at 18 months');
     expect(logs.lines.join('\n')).not.toMatch(/example\.com|Checkup|Garbage|h1/);

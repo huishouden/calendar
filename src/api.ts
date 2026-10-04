@@ -5,12 +5,13 @@ import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
 import type { Env, Fetch } from './env';
 import { feedUrl } from './feed';
 import { log } from './log';
-import { authOptions, overQuota } from './person';
+import { authOptions, overQuota, roleOf } from './person';
 import { Calendar, CalendarApiError } from './google/api';
 import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, revokeGoogle } from './google/oauth';
 import { deletePerson, deletePersonRows, loadPerson, moveFeed, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
 import { lastChecked } from './tick';
 import { FEED, markWork, SYNC } from './work';
+import { checkNow, connectInbox, disconnectInbox, MailHttpError, mailStatus } from './mail/api';
 
 /**
  * What the portal's Calendar page calls, as the signed-in person (their Firebase ID token in
@@ -28,6 +29,7 @@ import { FEED, markWork, SYNC } from './work';
  * No call here builds a feed or writes to Google: those are queued as work (src/work.ts), each in
  * its own invocation, so no request needs more than a few milliseconds of CPU.
  * - `POST /api/google/disconnect`: stop syncing; `deleteCalendar: true` also deletes the calendar.
+ * - `/api/mail/*`: Spending's alert inboxes (src/mail/api.ts), from Spending's settings.
  */
 
 export const GOOGLE_COLOUR = '#2d6a4f';
@@ -67,6 +69,8 @@ interface Caller {
   household: string;
   pid: string;
   idToken: string;
+  /** Their role in the household (admin, member, helper, kid), from the household document read here. */
+  role: string;
 }
 
 const HOUSEHOLD = /^[A-Za-z0-9_-]{1,128}$/;
@@ -95,7 +99,7 @@ async function caller(env: Env, request: Request, household: string | null, fetc
   });
   const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
   if (!members.includes(who.email)) throw new HttpError(403, 'not-member');
-  return { ...who, household, pid: await personId(household, who.email), idToken };
+  return { ...who, household, pid: await personId(household, who.email), idToken, role: roleOf(doc!.data, who.email) };
 }
 
 async function body(request: Request): Promise<Record<string, unknown>> {
@@ -266,6 +270,15 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
         log('api', { route: 'google-disconnect', ok: true, deleted: b.deleteCalendar === true });
         return json(200, await status(env, request, who), headers);
       }
+      case 'GET /api/mail/status':
+        if (who.role !== 'admin' && who.role !== 'member') throw new HttpError(403, 'not-allowed');
+        return json(200, await mailStatus(env, who), headers);
+      case 'POST /api/mail/connect':
+        return json(200, await connectInbox(env, who, b, { ...deps, now }), headers);
+      case 'POST /api/mail/check':
+        return json(200, await checkNow(env, who, { ...deps, now }), headers);
+      case 'POST /api/mail/disconnect':
+        return json(200, await disconnectInbox(env, who, b, { ...deps, now }), headers);
       case 'POST /api/notice/clear': {
         await upsertPersonRow(env, who.pid, { notice: null }, now);
         return json(200, await status(env, request, who), headers);
@@ -274,6 +287,7 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
         throw new HttpError(404, 'route');
     }
   } catch (e) {
+    if (e instanceof MailHttpError) e = new HttpError(e.status, e.code, e.detail);
     if (e instanceof HttpError) {
       log('api', { route: url.pathname, ok: false, status: e.status, code: e.code, ...(e.detail ? { detail: e.detail } : {}) });
       return json(e.status, { error: e.code }, headers);

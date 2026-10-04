@@ -52,7 +52,7 @@ export interface Loaded {
   todos: TodoItem[];
 }
 
-const roleOf = (data: Record<string, unknown>, email: string): Role => {
+export const roleOf = (data: Record<string, unknown>, email: string): Role => {
   const roles = (data.roles && typeof data.roles === 'object' ? data.roles : {}) as Record<string, unknown>;
   const members = Array.isArray(data.members) ? data.members : [];
   const r = roles[email];

@@ -4,17 +4,20 @@ import { handleApi } from './api';
 import { checkPeople, type CheckTotals } from './check';
 import { FEED_PATH, serveFeed } from './feed';
 import { log } from './log';
-import { runCron } from './tick';
+import { MAX_CALLS, runCron } from './tick';
+import { checkInboxes, runMailCron, type MailTotals } from './mail/check';
+import { runMailWork } from './mail/work';
 import { runWork, type WorkMessage, type WorkOutcome } from './work';
 import { warm } from './warm';
 
 warm();
 
 /**
- * Routes: `/feed/<secret>.ics` (the stored feed), `/api/*` (the portal), the cron (every minute:
- * the checks, fanned out), the queue (one unit of a person's work per message), and `Fanout`, the
- * entrypoint the cron and the work call through the `SELF` service binding so that each check and
- * each unit is its own invocation.
+ * Routes: `/feed/<secret>.ics` (the stored feed), `/api/*` (the portal, and Spending's alert
+ * inboxes), the cron (every minute: the calendar's checks, then the inboxes', fanned out), the queue
+ * (one unit of a person's or an inbox's work per message), and `Fanout`, the entrypoint the cron and
+ * the work call through the `SELF` service binding so that each check and each unit is its own
+ * invocation.
  */
 
 export class Fanout extends WorkerEntrypoint<Env> implements FanoutRpc {
@@ -24,6 +27,14 @@ export class Fanout extends WorkerEntrypoint<Env> implements FanoutRpc {
 
   async work(pid: string): Promise<WorkOutcome> {
     return runWork(this.env, pid, { next: (p) => this.env.SELF!.work(p) });
+  }
+
+  async mail(ids: string[]): Promise<MailTotals> {
+    return checkInboxes(this.env, ids);
+  }
+
+  async mailWork(id: string): Promise<WorkOutcome> {
+    return runMailWork(this.env, id, { next: (i) => this.env.SELF!.mailWork(i) });
   }
 }
 
@@ -38,13 +49,24 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runCron(env, { now: controller.scheduledTime }).then(() => undefined));
+    // The calendar's checks, then Spending's alert inboxes with the invocations they left.
+    const now = controller.scheduledTime;
+    ctx.waitUntil(
+      runCron(env, { now })
+        .catch(() => ({ calls: MAX_CALLS / 2 }))
+        .then((t) => runMailCron(env, { now, calls: Math.max(1, MAX_CALLS - (t.calls ?? 0)) }))
+        .then(() => undefined),
+    );
   },
 
   /** One message, one unit (max_batch_size = 1): each has the invocation's CPU time to itself. */
-  async queue(batch: MessageBatch<WorkMessage>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<WorkMessage | { inbox: string }>, env: Env): Promise<void> {
     for (const message of batch.messages) {
-      const outcome = await runWork(env, message.body.pid, { next: env.SELF ? (p) => env.SELF!.work(p) : undefined }).catch((): WorkOutcome => ({ retryAfter: 60, reason: 'error' }));
+      const body = message.body;
+      const outcome = await ('inbox' in body
+        ? runMailWork(env, body.inbox, { next: env.SELF ? (i) => env.SELF!.mailWork(i) : undefined })
+        : runWork(env, body.pid, { next: env.SELF ? (p) => env.SELF!.work(p) : undefined })
+      ).catch((): WorkOutcome => ({ retryAfter: 60, reason: 'error' }));
       if ('done' in outcome) {
         message.ack();
         continue;
@@ -55,4 +77,4 @@ export default {
       log('queue', { retry: outcome.reason, after: outcome.retryAfter });
     }
   },
-} satisfies ExportedHandler<Env, WorkMessage>;
+} satisfies ExportedHandler<Env, WorkMessage | { inbox: string }>;
