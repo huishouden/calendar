@@ -53,6 +53,17 @@ describe('connecting', () => {
     expect(w.google.live(calendarId).map((e) => e.summary).sort()).toEqual(['Checkup', 'Garbage pickup', 'Medicine for Nan', 'Power bill', 'To do: Buy paint']);
   });
 
+  test('a failed connect says why in the log (Google’s error name), with nothing personal', async () => {
+    const logs = captureLogs();
+    const res = await call('/api/google/connect', 'alice@example.com', { household, code: 'bad-code', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
+    logs.restore();
+    expect(res.status).toBe(400);
+    const line = JSON.parse(logs.lines.find((l) => l.includes('"api"'))!) as Record<string, unknown>;
+    expect(line.code).toBe('google-revoked');
+    expect(String(line.detail)).toContain('invalid_grant');
+    expect(logs.lines.join('\n')).not.toMatch(/example\.com|bad-code|h1/);
+  });
+
   test('Google’s code without calendar access is refused, and nothing is kept', async () => {
     const res = await call('/api/google/connect', 'alice@example.com', { household, code: 'no-calendar', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
     expect(res.status).toBe(400);
