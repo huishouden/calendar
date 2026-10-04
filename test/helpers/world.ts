@@ -7,6 +7,9 @@ import { forgetAccess } from '../../src/google/oauth';
 import { checkPeople } from '../../src/check';
 import { runWork, type WorkMessage } from '../../src/work';
 import { FakeGoogle } from './google';
+import { FakeGmail } from './gmail';
+import { checkInboxes } from '../../src/mail/check';
+import { runMailWork } from '../../src/mail/work';
 import { memoryD1, memoryKV } from './d1';
 import fixture from '../fixtures/household.json';
 
@@ -93,11 +96,12 @@ export async function writeDoc(path: string, data: Record<string, unknown>): Pro
 
 export interface World {
   env: Env & { TOKENS: KVNamespace & { map: Map<string, string> } };
-  /** Messages on the work queue, oldest first; `drain` runs them. */
-  queue: WorkMessage[];
+  /** Messages on the work queue (a person's, or an alert inbox's), oldest first; `drain` runs them. */
+  queue: (WorkMessage | { inbox: string })[];
   /** When set, the queue refuses messages (the free plan's daily operations used up). */
   queueFull: { on: boolean };
   google: FakeGoogle;
+  gmail: FakeGmail;
   fetch: (url: string, init?: RequestInit) => Promise<Response>;
   clock: { now: number };
   /** Requests that left for Firebase Auth. */
@@ -111,6 +115,7 @@ export function world(): World {
   forgetAccess();
   const clock = { now: NOW };
   const google = new FakeGoogle(() => clock.now);
+  const gmail = new FakeGmail();
   const authCalls: string[] = [];
   const sealKey = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
   const env = {
@@ -127,7 +132,7 @@ export function world(): World {
     FIRESTORE_URL: FIRESTORE,
   } as World['env'];
   const fakeFetch = async (url: string, init?: RequestInit): Promise<Response> => {
-    const fromGoogle = await google.handle(url, init);
+    const fromGoogle = (await gmail.handle(url, init)) ?? (await google.handle(url, init));
     if (fromGoogle) return fromGoogle;
     const u = new URL(url);
     if (u.hostname === 'securetoken.googleapis.com') {
@@ -144,10 +149,10 @@ export function world(): World {
     }
     return fetch(url, init);
   };
-  const queue: WorkMessage[] = [];
+  const queue: (WorkMessage | { inbox: string })[] = [];
   const queueFull = { on: false };
   env.WORK = {
-    send: async (m: WorkMessage) => {
+    send: async (m: WorkMessage | { inbox: string }) => {
       if (queueFull.on) throw new Error('Queue operations limit exceeded');
       queue.push(m);
     },
@@ -156,8 +161,10 @@ export function world(): World {
   env.SELF = {
     check: (pids) => checkPeople(env, pids, { fetch: fakeFetch, now: clock.now }),
     work: (pid) => runWork(env, pid, { fetch: fakeFetch, now: clock.now, next: (p) => env.SELF!.work(p) }),
+    mail: (ids) => checkInboxes(env, ids, { fetch: fakeFetch, now: clock.now, firestoreUrl: FIRESTORE }),
+    mailWork: (id) => runMailWork(env, id, { fetch: fakeFetch, now: clock.now, firestoreUrl: FIRESTORE, next: (i) => env.SELF!.mailWork(i) }),
   };
-  return { env, google, fetch: fakeFetch, clock, authCalls, queue, queueFull };
+  return { env, google, gmail, fetch: fakeFetch, clock, authCalls, queue, queueFull };
 }
 
 /** Runs the queue until it is empty, as the consumer does: one unit per message. Returns how many ran. */
@@ -166,7 +173,10 @@ export async function drain(w: World): Promise<number> {
   while (w.queue.length) {
     const m = w.queue.shift()!;
     n++;
-    const outcome = await runWork(w.env, m.pid, { fetch: w.fetch, now: w.clock.now, next: (p) => w.env.SELF!.work(p) });
+    const outcome =
+      'inbox' in m
+        ? await runMailWork(w.env, m.inbox, { fetch: w.fetch, now: w.clock.now, firestoreUrl: FIRESTORE, next: (i) => w.env.SELF!.mailWork(i) })
+        : await runWork(w.env, m.pid, { fetch: w.fetch, now: w.clock.now, next: (p) => w.env.SELF!.work(p) });
     if ('retryAfter' in outcome && n > 50) throw new Error('the queue keeps retrying');
   }
   return n;

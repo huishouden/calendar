@@ -10,6 +10,10 @@ in, and every person sets theirs up in the portal (Settings > Calendar):
   green, kept in step every 5 minutes, both ways. Moving, renaming or deleting an event there changes
   the record in the app. Each change shows in the portal's history with Undo.
 
+It also checks **Spending's alert inboxes**: Gmail accounts a member connected in Spending
+(Settings > Email) so the household's card-alert emails become transactions within about 5
+minutes, with no app open ("Spending's alert inboxes" below).
+
 What a person sees is what they may see in the household, in their language, with their settings.
 Helpers and kids get nothing private and no bills. Health items go only to the person, their carers
 and the admins, and by default read "Medicine for Ana" with no detail, because calendars are often
@@ -232,6 +236,81 @@ reads a day is $0.40 to $0.80 a day after the free 50,000 ($0.03 to $0.06 per 10
 by the database's location). Then raise or unset
 `FIRESTORE_CHECK_READS`.
 
+## Spending's alert inboxes
+
+Card alerts often arrive at a different Gmail address from the one a member signs in to Huishouden
+with. In Spending, Settings > Email > Connect alert inbox opens Google's account chooser
+(`googleAuthCode(…, { selectAccount: true })` in the kit), and the member picks the Gmail account
+the alerts go to and allows read-only access (`gmail.readonly`). Any admin or member may connect
+one, and a household may have several (two partners' cards). Helpers and kids never see Spending.
+
+| File | Does |
+|---|---|
+| `src/mail/api.ts` | Spending's calls: status, connect, check now, disconnect |
+| `src/mail/check.ts` | The checks: every 5 minutes per inbox, fanned out after the calendar's (`SELF.mail`) |
+| `src/mail/work.ts` | One unit of an inbox's import (queue message `{ inbox }`): search, read, parse, write |
+| `src/mail/gmail.ts` | Gmail's `profile`, `history.list`, `messages.list`, `messages.get` |
+| `src/mail/inbox.ts`, `src/mail/store.ts` | The household side as the member (cards, rules, the inbox's document); sealed records in D1 |
+
+### How a check works
+
+1. **Gmail's history.** `users.history.list` from the history id the last check ended at
+   (`historyTypes=messageAdded`): did any mail arrive? Usually not, and the check ends after one
+   request, with no Firestore read and no write.
+2. **The household's search.** When mail arrived, `users.messages.list` with the household's search
+   (the kit's `alertQuery`: each card's alert words, the alert labels) and `after:` the inbox's
+   `since` less a day. Messages already read are in D1's seen list. None new: done.
+3. **The import**, a queued unit of its own (3 messages per unit, so each fits the free plan's 10 ms
+   of CPU; a unit that leaves some hands the rest to the next). It reads the messages, parses them
+   with the kit's `@huishouden/pwa-kit/spending-core`, the very code Spending runs, in the
+   household's time zone, matches them against the household's transactions from four days before
+   the oldest (`planAlerts`: statements and other members' alerts are not added twice), and writes
+   the new ones as `spendingTransactions` (`source: 'alert'`) **as the member who connected the
+   inbox**, so the household's rules apply. The inbox's document gets `lastAlertAt` and `lastAdded`.
+
+The household's cards, labels and category rules are read as the member when an inbox is
+connected, on Check now, and at most every 12 hours, and kept sealed with the inbox. So a check
+needs no Firestore read, and an import reads only the recent transactions.
+
+**The first check** searches back to two days before the household's newest transaction, at most
+30 days: alerts missed while nothing was checking are added, and older ones (likely in a statement
+already) are not. When Gmail no longer has the history id (about a week without a check), the
+search covers the gap.
+
+**Errors.** Access removed in Google (`invalid_grant`): the inbox is marked `revoked`, its document
+says so, Spending shows Reconnect, and its checks stop until it is connected again. The member left
+the household or lost the role: `not-member`, checks stop. No alert words or labels:
+`nothing-to-search`. Gmail's rate limit backs the inbox off (30 s, doubling to an hour).
+
+**Disconnect** (the member who connected it, or an admin) deletes the inbox's document, revokes
+Google's grant (`oauth2.googleapis.com/revoke`), and deletes everything the Worker kept for it. The
+transactions it added stay: they are the household's.
+
+### Privacy
+
+- `gmail.readonly` is a **restricted** scope. Until Google verifies the app (a security assessment),
+  Google shows its "Google hasn't verified this app" warning in the window, and at most 100 Google
+  accounts can grant it. The Worker uses the grant only to search the household's alert words and
+  labels and to read the messages that match.
+- What is kept from an email is what Spending writes for it: date, merchant, amount, category, card
+  (last four digits), and the Gmail message id. Nothing else of an email is stored, and nothing of
+  one is logged. The logs hold counts (`found`, `read`, `added`, `duplicates`), never an address,
+  sender, subject or merchant; the Worker sends nothing to New Relic.
+- D1 holds each inbox under a hash; who connected it, its address, Google's refresh token, the
+  member's Firebase sign-in and the household's search terms are sealed (AES-GCM, `SEAL_KEY`).
+  Firestore holds only the address, who connected it and what the checker last found
+  (`spendingInboxes`, huishouden/rules).
+
+### What it costs
+
+Per inbox, every 5 minutes: one Google token (cached per isolate) and one history request. With
+mail, one search. With new alerts, one queued unit per 3 messages: about 6 requests, one Firestore
+query (the recent transactions), one commit. D1 is written only when something changed, or every 30
+minutes to move the history id; "Updated ... ago" comes from one row per minute of checks
+(`mail_ticks`). At 100 inboxes: about 29,000 checks a day in about 4,800 invocations, roughly
+10,000 D1 rows written, and Firestore reads only for imports (a handful per alert). Google's own
+limit is the binding one: 100 accounts while the app is unverified.
+
 ## Limits
 
 - **Subscribed feeds refresh slowly in Google Calendar.** Google re-reads a subscribed URL on its
@@ -324,6 +403,16 @@ Google sync again.
    test users but shows the scope as unlisted.
 
 Until `GOOGLE_CLIENT_SECRET` is set, the portal shows only the feed.
+
+### Spending's alert inboxes
+
+The same web client and secret. The **Gmail API** must be on in the project (it is in both
+huishouden-piekstra and huishouden-staging, because Spending's in-app check uses it too). Adding
+`.../auth/gmail.readonly` to the consent screen's scopes lists it there; it is a restricted scope,
+so Google keeps showing its unverified-app warning until the app passes verification.
+
+Spending calls this Worker at `VITE_CALENDAR_URL` and `STAGING_VITE_CALENDAR_URL`, repository
+variables on huishouden/spending as on the portal.
 
 ### The portal
 

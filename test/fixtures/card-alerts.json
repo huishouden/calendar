@@ -1,0 +1,65 @@
+[
+  {
+    "name": "HTML-only alert: merchant from a table cell, card from the last four digits",
+    "email": {
+      "from": "Example Card Co <notices@card.example.com>",
+      "subject": "Purchase alert",
+      "html": "<html><body><table><tr><td>Merchant</td><td>EXAMPLE PIZZA BAR</td></tr><tr><td>Amount</td><td>$23.40</td></tr></table><p>Card ending in 2222</p></body></html>"
+    },
+    "expected": { "description": "EXAMPLE PIZZA BAR", "amount": 23.4, "category": "Dining & Food", "card": "Card Two", "type": "Sale", "last4": "2222" }
+  },
+  {
+    "name": "'You spent $X at MERCHANT' with the household's rule for the category",
+    "email": {
+      "from": "alerts@bank.example.com",
+      "subject": "You spent $12.00",
+      "text": "You spent $12.00 at EXAMPLE GROCERY with your card ending in 1111."
+    },
+    "expected": { "description": "EXAMPLE GROCERY", "amount": 12, "category": "Groceries", "card": "Card One", "type": "Sale", "last4": "1111" }
+  },
+  {
+    "name": "No digits: a sender only one card lists names the card",
+    "email": {
+      "from": "Card Two Alerts <alerts@cardtwo.example.com>",
+      "subject": "Transaction alert",
+      "text": "A purchase of $7.25 at EXAMPLE KIOSK was made."
+    },
+    "expected": { "description": "EXAMPLE KIOSK", "amount": 7.25, "category": "Miscellaneous", "card": "Card Two", "type": "Sale" }
+  },
+  {
+    "name": "No digits and a sender several cards share: the card is not guessed",
+    "email": {
+      "from": "alerts@bank.example.com",
+      "subject": "Transaction alert",
+      "text": "A purchase of $7.25 at EXAMPLE KIOSK was made."
+    },
+    "expected": { "description": "EXAMPLE KIOSK", "amount": 7.25, "category": "Miscellaneous", "card": "Unknown Card", "type": "Sale" }
+  },
+  {
+    "name": "Digits the household has no card for are kept as digits",
+    "email": {
+      "from": "alerts@bank.example.com",
+      "subject": "Transaction alert",
+      "text": "You made a $9.40 transaction with EXAMPLE SHOP on your card ending in 4444"
+    },
+    "expected": { "description": "EXAMPLE SHOP", "amount": 9.4, "category": "Miscellaneous", "card": "Card ...4444", "type": "Sale", "last4": "4444" }
+  },
+  {
+    "name": "A refund is a negative Return",
+    "email": {
+      "from": "alerts@bank.example.com",
+      "subject": "Refund alert",
+      "text": "A refund of $18.00 from EXAMPLE OUTFITTERS was credited to your card ending in 1111"
+    },
+    "expected": { "description": "EXAMPLE OUTFITTERS", "amount": -18, "category": "Miscellaneous", "card": "Card One", "type": "Return", "last4": "1111" }
+  },
+  {
+    "name": "A payment notice is not a transaction",
+    "email": {
+      "from": "alerts@bank.example.com",
+      "subject": "We received your payment",
+      "text": "Thank you for your payment of $210.00 to your card ending in 1111."
+    },
+    "expected": null
+  }
+]
