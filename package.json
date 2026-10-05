@@ -2,20 +2,20 @@
   "name": "huishouden-calendar",
   "private": true,
   "license": "PolyForm-Shield-1.0.0",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "lint": "tsc --noEmit && tsc --noEmit -p test",
-    "test": "bun test",
+    "test": "bunx firebase emulators:exec --only firestore --project demo-huishouden-calendar \"bun test\"",
+    "test:emulator": "bun run test",
     "seal-key": "bun scripts/seal-key.ts",
     "dev": "wrangler dev --test-scheduled",
     "deploy": "wrangler d1 migrations apply huishouden-calendar --remote && wrangler deploy",
     "deploy:staging": "wrangler d1 migrations apply huishouden-calendar-staging --remote --env staging && wrangler deploy --env staging",
-    "prepare": "git config core.hooksPath .githooks || true",
-    "test:emulator": "firebase emulators:exec --only firestore --project demo-huishouden-calendar \"bun test\""
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
-    "@huishouden/pwa-kit": "github:huishouden/pwa-kit#v0.84.0"
+    "@huishouden/pwa-kit": "github:huishouden/pwa-kit#v0.101.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261002.1",

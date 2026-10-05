@@ -16,8 +16,9 @@ minutes, with no app open ("Spending's alert inboxes" below).
 
 What a person sees is what they may see in the household, in their language, with their settings.
 Helpers and kids get nothing private and no bills. Health items go only to the person, their carers
-and the admins, and by default read "Medicine for Ana" with no detail, because calendars are often
-shared.
+and the admins, and by default read "Medicine for Ana" or "Appointment for Ana" with no detail, because calendars are often
+shared. With Health details turned on in the person's calendar settings, an appointment's description
+carries its kind, doctor, place and what to bring; its notes never leave the app.
 
 The Worker acts **only as the person** with their own Firebase sign-in, so the household's Firestore
 rules (huishouden/rules) decide every read and write, exactly as in the apps. It has no service
@@ -514,7 +515,7 @@ account's workers.dev subdomain.
 ```sh
 bun install
 bun run lint
-bun run test:emulator   # the Firestore emulator with huishouden/rules' rules (a checkout next to this one, or RULES_PATH)
+bun run test            # in the Firestore emulator with huishouden/rules' rules (a checkout next to this one, or RULES_PATH)
 ```
 
 The tests use the real household rules in the Firestore emulator. Google (OAuth, Calendar API,
