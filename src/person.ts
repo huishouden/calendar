@@ -124,11 +124,13 @@ export class Person {
   /** Several documents in one request (`documents:batchGet`), in order; null for a missing one. */
   async getAll(paths: string[]): Promise<(Record<string, unknown> | null)[]> {
     const root = `projects/${this.env.FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+    // The token first, outside the try: a sign-in that is gone must surface as Firebase's error, not as Firestore unreachable.
+    const token = await this.token();
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.firestoreUrl}/${root}:batchGet`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${await this.token()}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ documents: paths.map((p) => `${root}/${p}`) }),
       });
     } catch {
