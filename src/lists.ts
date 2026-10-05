@@ -22,8 +22,8 @@ import { seal, unseal } from './seal';
  *
  * The same assumption as the change signal (src/person.ts): every write sets `updatedAt`. A copy is
  * read whole again once it is a day old (`LIST_MAX_AGE_MS`), which also repairs anything that
- * didn't. Shared lists are kept per household and restricted flag, so members who may read the
- * same documents share one copy; personal lists per member. Keys are hashes (no household id or
+ * didn't. Each copy is keyed by its household, collection and query, so only people whose query is
+ * the same share one (a helper's asks `private == false`; a personal list's names the member). Keys are hashes (no household id or
  * email in the table) and each copy is sealed for its key.
  */
 
@@ -63,12 +63,16 @@ export interface ListReads {
 export type ListOutcome = 'kept' | 'delta' | 'full';
 
 /** The key of a kept list: a hash of the household, the collection and whose view it is. */
-export const listKey = (household: string, collection: string, scope: string): Promise<string> => sha256(`list\u0000${household}\u0000${collection}\u0000${scope}`);
+export const listKey = (household: string, collection: string, query: string): Promise<string> => sha256(`list\u0000${household}\u0000${collection}\u0000${query}`);
 
 /** The list's documents, from the kept copy where it is still right (see above). */
 export async function readList(env: Env, key: string, reads: ListReads, now: number): Promise<{ docs: Doc[]; outcome: ListOutcome }> {
   const fresh = await reads.tally();
-  const row = env.DB ? await env.DB.prepare('SELECT body, at FROM lists WHERE key = ?').bind(key).first<{ body: string; at: number }>() : null;
+  // The copy is best-effort: D1 failing (its daily writes used up) costs reads, never the load.
+  const row = await env.DB.prepare('SELECT body, at FROM lists WHERE key = ?')
+    .bind(key)
+    .first<{ body: string; at: number }>()
+    .catch(dbFailed);
   const kept = row && now - row.at < LIST_MAX_AGE_MS && row.at <= now ? await unseal<Kept>(env.SEAL_KEY, `list:${key}`, row.body) : null;
   if (kept && row) {
     if (same(tallyOf(kept.docs), fresh)) {
@@ -92,8 +96,16 @@ export async function readList(env: Env, key: string, reads: ListReads, now: num
   return { docs, outcome: 'full' };
 }
 
+const dbFailed = (e: unknown): null => {
+  log('lists', { kept: false, reason: e instanceof Error ? e.name : 'unknown' });
+  return null;
+};
+
 async function store(env: Env, key: string, docs: Doc[], at: number, now: number): Promise<void> {
-  if (!env.DB) return;
+  await write(env, key, docs, at, now).catch(dbFailed);
+}
+
+async function write(env: Env, key: string, docs: Doc[], at: number, now: number): Promise<void> {
   const body = await seal(env.SEAL_KEY, `list:${key}`, { docs } satisfies Kept);
   if (body.length > MAX_SEALED) {
     await env.DB.prepare('DELETE FROM lists WHERE key = ?').bind(key).run();
@@ -107,7 +119,7 @@ async function store(env: Env, key: string, docs: Doc[], at: number, now: number
 
 /** Marks a copy used, at most once an hour (rows written are a free-plan limit too). */
 async function touch(env: Env, key: string, now: number): Promise<void> {
-  await env.DB.prepare('UPDATE lists SET used_at = ?1 WHERE key = ?2 AND used_at < ?3').bind(now, key, now - 3_600_000).run();
+  await env.DB.prepare('UPDATE lists SET used_at = ?1 WHERE key = ?2 AND used_at < ?3').bind(now, key, now - 3_600_000).run().catch(dbFailed);
 }
 
 /** Deletes copies nobody has used for `LIST_FORGET_MS` (a member who left, a household gone). */

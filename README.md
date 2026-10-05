@@ -7,8 +7,9 @@ in, and every person sets theirs up in the portal (Settings > Calendar):
   Outlook and any other calendar app subscribes to. It is read-only and refreshes as often as the
   calendar app checks.
 - **Google Calendar sync**: a "Huishouden" calendar in the person's Google account, in the suite's
-  green, kept in step every 5 minutes, both ways. Moving, renaming or deleting an event there changes
-  the record in the app. Each change shows in the portal's history with Undo.
+  green, kept in step both ways: Google is checked every 5 minutes, and the household every 5 while
+  it changes (every 15 while it is quiet, so a first change after a quiet spell can take up to 15).
+  Moving, renaming or deleting an event there changes the record in the app. Each change shows in the portal's history with Undo.
 
 It also checks **Spending's alert inboxes**: Gmail accounts a member connected in Spending
 (Settings > Email) so the household's card-alert emails become transactions within about 5
@@ -271,8 +272,8 @@ data centre and can be evicted at any time, so a feed there would still need reb
 a Google person gets about 144 a day (96 while quiet, every 15 minutes, plus every 5 minutes for the
 quarter of the day their household is active): 1,000 people is ~860,000 reads a day, against 50,000
 a day on the free Spark plan for everything. Loads add little: 3 changes × 2 loads (sync and feed)
-× ~6 reads (four aggregations and what changed) is ~36 a person, where reading every document was
-~700 (3 × 2 × ~115). With `FIRESTORE_CHECK_READS = 20000` (40% of the free reads), Spark keeps
+× ~7 reads (four aggregations, a query for what changed, a document or two) is ~42 a person, where
+reading every document was ~700 (3 × 2 × ~115). With `FIRESTORE_CHECK_READS = 20000` (40% of the free reads), Spark keeps
 5-minute Google checks for about 23 people (20,000 ÷ (144 × 6)) or 34 with only a feed
 (20,000 ÷ (96 × 6)). Past that, the checks space out on their own, down to hourly. 1,000 people
 within 5 to 15 minutes of a change needs the project on Blaze: ~860,000 reads a day is $0.25 to $0.50
@@ -393,12 +394,14 @@ limit is the binding one: 100 accounts while the app is unverified.
   own schedule, typically every 8 to 24 hours, and ignores `REFRESH-INTERVAL`. Apple Calendar
   follows the hourly hint (or its own setting); Outlook refreshes on its own schedule, every few hours. For Google, use
   the sync, which shows changes within about 5 minutes.
-- **A change reaches Google within 5 minutes**, plus a few seconds for the work: the check that
-  notices it runs every 5 minutes (longer only when Firestore's read budget asks, see "Many
-  households"), and the work runs within seconds of it.
+- **A change reaches Google within 5 minutes while the household is active**, plus a few seconds
+  for the work. After a quiet hour the household side is read every 15 minutes, so the first change
+  can take up to 15; the ones after it are seen within 5 (longer only when Firestore's read budget
+  asks, see "Many households"). A role change or a member leaving is seen the same way: within 15
+  minutes in a quiet household. Changes made in Google are seen within 5 minutes.
 - **Firestore's free tier**: a household-side check costs about 6 billed reads (every 15 minutes
   while the household is quiet, every 5 while it changes). A feed build or a sync round costs 4
-  aggregation reads plus what changed (`src/lists.ts`); the whole list (a few hundred documents in a
+  aggregation reads plus what changed (`src/lists.ts`); the whole list (about 115 documents in a
   busy household) only when something was deleted, for a helper's or kid's or a personal list that
   changed, or once a day. When the project's daily quota is used up (Spark: 50,000
   reads), Firestore answers 429 until midnight Pacific time: the portal's calls get 503
@@ -408,8 +411,9 @@ limit is the binding one: 100 accounts while the app is unverified.
   1 to 2 ms. A check is 2 people. A feed build or a sync round is one person in its own invocation,
   and the cold start (language catalogues, the runtime's time zone data) happens once per isolate at
   startup (`src/warm.ts`), which Cloudflare limits separately. Builds and some portal calls still
-  measure 8 to 18 ms (below), because a build needs 5 Firestore reads and 2 D1 calls at about 1 ms
-  each. Cloudflare answered every one of them `ok`: the free plan doesn't refuse an invocation the
+  measure 8 to 18 ms (below), because a build needs about 6 Firestore requests (the household and
+  settings, four aggregations, and a query for each list that changed) and 2 to 3 D1 calls at about
+  1 ms each. Cloudflare answered every one of them `ok`: the free plan doesn't refuse an invocation the
   moment it passes 10 ms. Workers Paid ($5 a month) raises the limit to 30 seconds and removes the
   question.
 - **Ahead of the window**: apps publish 180 days ahead (Home's regular events 60). A repeating event

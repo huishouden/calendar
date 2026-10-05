@@ -165,7 +165,7 @@ export async function buildFeed(env: Env, pid: string, deps: WorkDeps & { record
     const events = exportEvents({ ...loaded, me: record.email, role: view.role, lang: record.lang, timeZone, settings: view.settings, home: view.home?.address });
     const body = exportIcs(events, { householdId: record.household, timeZone, lang: record.lang, now });
     await putFeed(env, pid, record.feed.secret, { signal, etag: `"${contentHash(body)}"`, body, now });
-    log('feed', { built: true, events: events.length, problems: icsProblems(body).length });
+    log('feed', { built: true, events: events.length, problems: icsProblems(body).length, lists: Object.entries(loaded.reads).map(([c, o]) => `${c}:${o}`).join(' ') });
   } catch (e) {
     if (e instanceof NotMember) {
       await dropFeed(env, pid, now);

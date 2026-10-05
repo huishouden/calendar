@@ -5,7 +5,7 @@ import { log } from './log';
 import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
-import { eventRows, openPerson, savePerson, upsertPersonRow, type PersonRow } from './store';
+import { eventRows, openPerson, savePerson, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
 import { FULL_EVERY_MS, isEcho } from './sync';
 import { dropFeed, FEED, markWork, SYNC } from './work';
 
@@ -175,10 +175,9 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
   }
 
   // The household's side: only when due (`householdDue`); the reasons a sync or feed is due anyway still count.
+  kinds |= dueAnyway(row, record, now, !!google);
   if (google && !householdDue(row, now, deps.googleEvery)) {
     totals.quiet++;
-    if (!row.full_at || now - row.full_at > FULL_EVERY_MS) kinds |= SYNC;
-    if (record.feed && row.feed === 1 && row.feed_stale) kinds |= FEED;
     return kinds;
   }
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
@@ -203,9 +202,15 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
     // Seen changing (not the first time it is seen): the household counts as active for an hour.
     await env.DB.prepare('UPDATE people SET hh_signal = ?, hh_signal_at = ? WHERE pid = ?').bind(signal, row.hh_signal ? now : 0, row.pid).run();
   }
-  if (google && (signal !== row.signal || !row.full_at || now - row.full_at > FULL_EVERY_MS)) kinds |= SYNC;
-  if (record.feed && row.feed === 1) {
-    if (!row.feed_signal || row.feed_signal !== signal || row.feed_stale) kinds |= FEED;
-  }
+  if (google && signal !== row.signal) kinds |= SYNC;
+  if (record.feed && row.feed === 1 && (!row.feed_signal || row.feed_signal !== signal)) kinds |= FEED;
+  return kinds;
+}
+
+/** The work due whatever the household did: a sync not fully rebuilt in FULL_EVERY_MS, a feed a request marked stale. */
+export function dueAnyway(row: Pick<CheckRow, 'full_at' | 'feed' | 'feed_stale'>, record: Pick<PersonRecord, 'feed'>, now: number, google: boolean): number {
+  let kinds = 0;
+  if (google && (!row.full_at || now - row.full_at > FULL_EVERY_MS)) kinds |= SYNC;
+  if (record.feed && row.feed === 1 && row.feed_stale) kinds |= FEED;
   return kinds;
 }
