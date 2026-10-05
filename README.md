@@ -167,7 +167,8 @@ The limits that shape it:
 | CPU per invocation (request, cron, queue message) | 10 ms |
 | Subrequests per invocation | 50 (1,000 to Cloudflare services) |
 | Invocations a request may start through service bindings | 32 |
-| Workers requests | 100,000 a day |
+| Workers requests | 100,000 a day (a service binding call is not another request: billed as the caller's) |
+| Durable Objects (SQLite) | 100,000 requests (alarms included) and 13,000 GB-s a day |
 | Queues | 10,000 operations a day (3 per message: write, read, delete) |
 | KV | 100,000 reads, 1,000 writes a day |
 | D1 | 5 million rows read, 100,000 rows written a day; 5 GB |
@@ -177,17 +178,25 @@ The limits that shape it:
 
 1. **The cron, every minute** (`src/tick.ts`). Each person has a fixed slot (a number 0..59 from
    their `pid`). People with Google are checked every 5 minutes, people with only a feed every 15
-   (calendar apps fetch hourly at most). The people due this minute go out in chunks of 8, a
+   (calendar apps fetch hourly at most). The people due this minute go out in chunks of 2, a
    household's members together, each chunk to **its own invocation** of this Worker:
    `env.SELF.check(pids)`, a service binding to the Worker's own `Fanout` entrypoint. Each
-   invocation has its own 10 ms and 50 subrequests. The cron starts at most 30 (Cloudflare allows
-   32 per request).
+   invocation has its own 10 ms and 50 subrequests. Two people per invocation, because each
+   subrequest costs an invocation about 1 ms of CPU (measured, below).
+   - **More roots: Tickers.** One request may start at most 32 invocations, so the cron starts at
+     most 30. When a minute has more chunks than that, the cron arms **Ticker** Durable Objects
+     (`src/ticker.ts`, at most 7). Each Ticker's alarm fires every minute, 5 seconds after the cron,
+     as its own top-level invocation with its own 32. It checks every n-th chunk of the minute
+     (part k of n). A Ticker whose part is no longer needed lets its alarm lapse. Capacity:
+     8 roots × 30 invocations × 2 people = 480 people a minute.
+   - **More people than that**: the checks space out (every 10, 15, ... minutes) rather than
+     overflow. Worked out once an hour, with the Firestore budget below.
 2. **The check** (`src/check.ts`), per person: Google's change list with the sync token (our own
    writes coming back move the token on, nothing more), then the change signal. The household and
    the person's settings come in one `batchGet`. The household's shared lists are read once for all
    its members in the chunk: the count and sum are the same query whoever asks, and only go into
    each member's own signal. **When nothing changed, nothing is written**: no D1 row, no queue
-   message. A chunk stops before its 50 subrequests, and the cron gives the rest to another
+   message. A chunk stops before its 50 subrequests, and the root gives the rest to another
    invocation.
 3. **The work** (`src/work.ts`): a check that finds a change marks it in D1 and sends **one queue
    message for the person** (never a second while one is on its way). The consumer takes one
@@ -219,13 +228,16 @@ once).
 
 | Resource | Arithmetic | A day | Free plan |
 |---|---|---|---|
-| Workers requests | cron 1,440 + checks 1,000 × 288 ÷ 8 = 36,000 + feed fetches 1,000 × 24 = 24,000 + sync units 3,000 + feed units 3,000 + portal ~500 | **~68,000** | 100,000 |
-| (all feed-only instead) | cron 1,440 + checks 1,000 × 96 ÷ 8 = 12,000 + fetches 24,000 + checks asked by fetches 24,000 + feed units 3,000 + portal ~500 | ~65,000 | 100,000 |
-| Invocations per cron run | 1,000 × 12 slots ÷ 60 minutes = 200 people a minute ÷ 8 | 25 | 32 |
-| Subrequests per check invocation | 8 people × ~5 (change list, `batchGet`, 2 aggregations, a token now and then) + the household's 2 shared aggregations | ~45 | 50 |
+| People due a minute | 1,000 × 12 slots ÷ 60 minutes | 200 | 480 (capacity) |
+| Roots a minute | 200 ÷ 2 = 100 check invocations ÷ 30 per root | the cron + 3 Tickers | 8 |
+| Workers requests | cron 1,440 + feed fetches 1,000 × 24 = 24,000 + queued units 6,000 + portal ~500 (check invocations go through the service binding: no requests of their own) | **~32,000** | 100,000 |
+| (if service-binding calls counted) | + 1,000 × 288 ÷ 2 = 144,000 check invocations | ~176,000 | over: then 5-minute checks for ~400 people |
+| Durable Object requests | 3 Tickers × 1,440 alarms (+ an hourly arm) | ~4,400 | 100,000 |
+| Durable Object duration | 4,320 alarms × ~2 s (waiting on their checks) × 128 MB | ~1,100 GB-s | 13,000 GB-s |
+| Subrequests per check invocation | 2 people × ~5 (change list, `batchGet`, 2 aggregations, a token now and then) + the household's shared 2 | ~12 | 50 |
 | Queue operations | 3,000 messages × 3 | **9,000** | 10,000 (more runs from the cron) |
 | D1 rows written | per change ~15 (mark, lease, person, ~2 events, release, feed; indexes included) × 3,000 = 45,000 + token after echoes 3,000 + ticks 1,440 + stale feeds 5,000 | **~55,000** | 100,000 |
-| D1 rows read | cron 200 a minute × 1,440 = 288,000 + checks 288,000 + feed rows 288,000 + events read on echoes ~150,000 + syncs ~160,000 + fetches 24,000 | ~1.2 million | 5 million |
+| D1 rows read | roots 200 a minute × 1,440 = 288,000 (× 4 roots: each reads the minute's list) ~1.2 million + checks 288,000 + events read on echoes ~150,000 + syncs ~160,000 + fetches 24,000 | ~1.8 million | 5 million |
 | D1 storage | feeds ~40 KB sealed + ~50 events × ~1 KB, per person | ~90 MB | 5 GB |
 | KV | reads: none on the request path (only a feed with nothing stored); writes: one per feed set up or rotated | ~0 / ~10 | 100,000 / 1,000 |
 
@@ -364,11 +376,14 @@ limit is the binding one: 100 accounts while the app is unverified.
   reads), Firestore answers 429 until midnight Pacific time: the portal's calls get 503
   `firestore-quota` (the portal says so, rather than "couldn't reach"), feeds serve what is stored,
   and the checks pause.
-- **CPU**: every invocation stays within the free plan's 10 ms. A request serves what is stored. A
-  check is a few small reads per person. A build or a sync round is one person's calendar in its own
-  invocation, and the cold start (language catalogues, the runtime's time zone data, compiling the
-  export) happens once per isolate at startup (`src/warm.ts`), which Cloudflare limits separately.
-  Measured on staging: see "CPU, measured" below.
+- **CPU**: the free plan allows 10 ms per invocation. A feed request serves what is stored, at
+  1 to 2 ms. A check is 2 people. A feed build or a sync round is one person in its own invocation,
+  and the cold start (language catalogues, the runtime's time zone data) happens once per isolate at
+  startup (`src/warm.ts`), which Cloudflare limits separately. Builds and some portal calls still
+  measure 8 to 18 ms (below), because a build needs 5 Firestore reads and 2 D1 calls at about 1 ms
+  each. Cloudflare answered every one of them `ok`: the free plan doesn't refuse an invocation the
+  moment it passes 10 ms. Workers Paid ($5 a month) raises the limit to 30 seconds and removes the
+  question.
 - **Ahead of the window**: apps publish 180 days ahead (Home's regular events 60). A repeating event
   carries on past that by its schedule. A skip or move further ahead shows once it is within the
   app's window.
@@ -386,8 +401,25 @@ limit is the binding one: 100 accounts while the app is unverified.
 
 ### CPU, measured
 
-Staging, `wrangler tail` (each invocation's `cpuTime`): to follow, once staging's Firestore quota is
-back.
+Staging, 5 October 2026, `wrangler tail --format json` (each invocation's `cpuTime`), during the
+portal's staging e2e (three people set up feeds with 1 to 3 events, fetch them, change a setting,
+rotate, revoke) and the minute ticks. Warm means the isolate had served a request before.
+
+| Invocation | Subrequests | CPU (ms) |
+|---|---|---|
+| Feed request, stored, warm | 1 D1 read, AES-GCM open | **0 to 2** |
+| Feed request, first in a fresh isolate | the same | 4 to 5 |
+| Feed request, unknown URL (404) | 1 D1, 1 KV | 1 to 2 |
+| Portal: status | household read, 2 to 3 D1 | 3 to 5 |
+| Portal: revoke | household read, D1, KV | 5 |
+| Portal: rotate (same calendar sealed for the new URL) | household read, D1, KV | 8 |
+| Portal: make the link (first time: refresh-token exchange) | household read, token exchange, D1, KV, then the build in its own invocation | 9 to 16 |
+| Cron tick, nobody due | 3 to 4 D1 | 2 to 6 |
+| Check, one feed-only person | batchGet, 2 to 4 aggregations, a token, 2 D1 | 7 to 8 |
+| Feed build (its own invocation; queue or `SELF.work`), 1 to 3 events | lease, batchGet, 4 queries, 2 D1 | 10 to 18 |
+
+Locally (workerd under the DevTools profiler), the export itself, 50 events
+in a warm isolate, is about 2 ms: the time is in the subrequests, not the calendar's size.
 
 ## One-time setup
 

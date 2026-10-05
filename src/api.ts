@@ -1,4 +1,4 @@
-import { exchangeRefreshToken, FirebaseAuthError, verifyIdToken } from '@huishouden/pwa-kit/firebase-auth-rest';
+import { exchangeRefreshToken, FirebaseAuthError, jwtClaims } from '@huishouden/pwa-kit/firebase-auth-rest';
 import { FirestoreError, FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
 import { isLang, type Lang } from '@huishouden/pwa-kit/i18n';
 import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
@@ -81,23 +81,38 @@ const HOUSEHOLD = /^[A-Za-z0-9_-]{1,128}$/;
 /** 503, saying which: `firestore-quota` (back after the daily reset; retrying sooner only uses requests) or `unavailable`. */
 const unavailable = (e: unknown) => new HttpError(503, overQuota(e) ? 'firestore-quota' : 'unavailable');
 
+/** The token's person (uid, verified email) if its claims are for this project and unexpired; null otherwise. */
+function claimedPerson(env: Env, idToken: string, now = Date.now()): { uid: string; email: string } | null {
+  let claims: Record<string, unknown>;
+  try {
+    claims = jwtClaims(idToken);
+  } catch {
+    return null;
+  }
+  if (claims.aud !== env.FIREBASE_PROJECT_ID || claims.iss !== `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) return null;
+  if (typeof claims.exp !== 'number' || claims.exp * 1000 <= now) return null;
+  const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
+  const uid = typeof claims.user_id === 'string' ? claims.user_id : typeof claims.sub === 'string' ? claims.sub : '';
+  if (!email || !uid || claims.email_verified !== true) return null;
+  return { uid, email };
+}
+
 async function caller(env: Env, request: Request, household: string | null, fetchImpl: Fetch | undefined, firestoreUrl?: string): Promise<Caller> {
   const idToken = /^Bearer (.+)$/.exec(request.headers.get('Authorization') ?? '')?.[1];
   if (!idToken) throw new HttpError(401, 'sign-in');
   if (!household || !HOUSEHOLD.test(household)) throw new HttpError(400, 'household');
-  let who;
-  try {
-    who = await verifyIdToken(authOptions(env, fetchImpl), idToken);
-  } catch (e) {
-    if (e instanceof FirebaseAuthError && e.kind === 'unavailable') throw new HttpError(503, 'unavailable');
-    throw new HttpError(401, 'sign-in');
-  }
+  // Who the token says, read without a call: Firestore checks the token itself (signature, project,
+  // expiry) on the household read below, which fails with 401 for anything forged or stale. Before,
+  // a separate Firebase Auth lookup did that check, one more subrequest per call.
+  const who = claimedPerson(env, idToken);
+  if (!who) throw new HttpError(401, 'sign-in');
   // A member reads their household; anyone else is refused by the rules.
   const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, ...(fetchImpl ? { fetch: fetchImpl } : {}), ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}) });
   // Only the rules' refusal (or no such household) means "not a member". Anything else, such as
   // Firestore's daily quota (429 RESOURCE_EXHAUSTED) or an outage, is the service being unavailable.
   const doc = await db.get(`households/${household}`).catch((e: unknown) => {
     if (e instanceof FirestoreError && (e.code === 'permission-denied' || e.code === 'not-found')) return null;
+    if (e instanceof FirestoreError && e.code === 'unauthenticated') throw new HttpError(401, 'sign-in');
     throw unavailable(e);
   });
   const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
@@ -121,7 +136,8 @@ async function personFrom(env: Env, who: Caller, b: Record<string, unknown>, fet
   const lang: Lang = isLang(b.lang) ? b.lang : (existing?.lang ?? 'en');
   const timeZone = typeof b.timeZone === 'string' && isTimeZone(b.timeZone) ? b.timeZone : (existing?.timeZone ?? 'UTC');
   let refreshToken = existing?.refreshToken;
-  if (typeof b.refreshToken === 'string' && b.refreshToken.length >= 20 && b.refreshToken.length <= 4096) {
+  // A refresh token already kept for this person was checked when it was kept: no exchange again.
+  if (typeof b.refreshToken === 'string' && b.refreshToken !== existing?.refreshToken && b.refreshToken.length >= 20 && b.refreshToken.length <= 4096) {
     let checked;
     try {
       checked = await exchangeRefreshToken(authOptions(env, fetchImpl), b.refreshToken);

@@ -67,6 +67,17 @@ export const signalExtra = (view: Pick<View, 'home'>, record: Pick<PersonRecord,
 export interface Loaded {
   agenda: AgendaItem[];
   todos: TodoItem[];
+  /** Each list's count and sum of `updatedAt`, as the signal's aggregations would say: the signal without asking again. */
+  tally: Tally[];
+}
+
+export type Tally = { count: number; sums: Record<string, number> };
+
+/** What `aggregate(..., ['updatedAt'])` answers for these documents: how many, and the sum of their numeric `updatedAt`. */
+export function tallyOf(docs: { data: Record<string, unknown> }[]): Tally {
+  let sum = 0;
+  for (const d of docs) if (typeof d.data.updatedAt === 'number') sum += d.data.updatedAt;
+  return { count: docs.length, sums: { updatedAt: sum } };
 }
 
 export const roleOf = (data: Record<string, unknown>, email: string): Role => {
@@ -113,11 +124,13 @@ export class Person {
   /** Several documents in one request (`documents:batchGet`), in order; null for a missing one. */
   async getAll(paths: string[]): Promise<(Record<string, unknown> | null)[]> {
     const root = `projects/${this.env.FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+    // The token first, outside the try: a sign-in that is gone must surface as Firebase's error, not as Firestore unreachable.
+    const token = await this.token();
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.firestoreUrl}/${root}:batchGet`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${await this.token()}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ documents: paths.map((p) => `${root}/${p}`) }),
       });
     } catch {
@@ -210,7 +223,12 @@ export class Person {
       view.settings.todos ? common('todos') : Promise.resolve(zero),
       view.settings.todos ? this.optional(() => this.db.aggregate(this.base, PERSONAL_TODOS, { where: this.mine(view) }, ['updatedAt']), zero) : Promise.resolve(zero),
     ]);
-    return contentHash(JSON.stringify([agenda, personal, todos, personalTodos, view.role, view.settingsAt, view.settings, extra]));
+    return signalFrom(view, [agenda, personal, todos, personalTodos], extra);
+  }
+
+  /** The same signal from what `load` read: no aggregations. */
+  signalOf(view: View, loaded: Loaded, extra = ''): string {
+    return signalFrom(view, loaded.tally, extra);
   }
 
   /** Everything the person can read that a calendar may show. */
@@ -222,11 +240,15 @@ export class Person {
       view.settings.todos ? this.optional(() => this.db.query(this.base, PERSONAL_TODOS, { where: this.mine(view) }), []) : Promise.resolve([]),
     ]);
     return {
+      tally: [agenda, personal, todos, personalTodos].map(tallyOf),
       agenda: [...agenda, ...personal].map((d) => ({ ...toAgendaItem(d.id, d.data), ...(d.path.includes(`/${PERSONAL_AGENDA}/`) ? { audience: toAgendaItem(d.id, d.data).audience ?? [] } : {}) })),
       todos: [...todos, ...personalTodos].map((d) => toTodoItem(d.id, d.data)),
     };
   }
 }
+
+const signalFrom = (view: View, tallies: Tally[], extra: string): string =>
+  contentHash(JSON.stringify([...tallies, view.role, view.settingsAt, view.settings, extra]));
 
 /** Firestore said the project's daily quota is used up (429 RESOURCE_EXHAUSTED; Spark resets at midnight Pacific). */
 export const overQuota = (e: unknown): boolean => e instanceof FirestoreError && /\b429\b|RESOURCE_EXHAUSTED/.test(e.message);

@@ -5,7 +5,7 @@ import { log } from './log';
 import { NotMember, Person, signalExtra, signInGone, zoneOf } from './person';
 import { CalendarApiError, isRateLimited } from './google/api';
 import { GoogleAuthError } from './google/oauth';
-import { loadPerson, putFeed, revokeFeed, savePerson, upsertPersonRow } from './store';
+import { loadPerson, openPerson, putFeed, revokeFeed, savePerson, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
 import { syncPerson } from './sync';
 
 /**
@@ -90,10 +90,10 @@ async function send(env: Env, pid: string): Promise<boolean> {
 export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promise<WorkOutcome> {
   const now = deps.now ?? Date.now();
   const held = await env.DB.prepare(
-    'UPDATE people SET lease_until = ?1 WHERE pid = ?2 AND (lease_until IS NULL OR lease_until <= ?3) AND (backoff_until IS NULL OR backoff_until <= ?3) RETURNING work, backoff',
+    'UPDATE people SET lease_until = ?1 WHERE pid = ?2 AND (lease_until IS NULL OR lease_until <= ?3) AND (backoff_until IS NULL OR backoff_until <= ?3) RETURNING *',
   )
     .bind(now + LEASE_MS, pid, now)
-    .first<{ work: number; backoff: number }>();
+    .first<PersonRow>();
   if (!held) {
     const row = await env.DB.prepare('SELECT lease_until, backoff_until FROM people WHERE pid = ?').bind(pid).first<{ lease_until: number | null; backoff_until: number | null }>();
     if (!row) return { done: true };
@@ -108,10 +108,10 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
   let more = false;
   try {
     if (kind === SYNC) {
-      const counts = await syncPerson(env, pid, deps);
+      const counts = await syncPerson(env, pid, { ...deps, row: held });
       if (counts.limited) throw new RateLimitedWrites();
       more = counts.more;
-    } else await buildFeed(env, pid, deps);
+    } else await buildFeed(env, pid, { ...deps, record: await openPerson(env, pid, held.record) });
   } catch (e) {
     if (e instanceof RateLimitedWrites || isRateLimited(e)) {
       const n = held.backoff + 1;
@@ -151,15 +151,15 @@ export const FEED_MAX_AGE_MS = 24 * 3_600_000;
  * The person's feed, worked out as them and stored sealed for its URL (src/store.ts `putFeed`):
  * what a feed request serves. Someone who left the household loses the feed.
  */
-export async function buildFeed(env: Env, pid: string, deps: WorkDeps = {}): Promise<void> {
+export async function buildFeed(env: Env, pid: string, deps: WorkDeps & { record?: PersonRecord | null } = {}): Promise<void> {
   const now = deps.now ?? Date.now();
-  const record = await loadPerson(env, pid);
+  const record = deps.record !== undefined ? deps.record : await loadPerson(env, pid);
   if (!record?.feed) return;
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
   try {
     const view = await person.view();
-    const signal = await person.signal(view, signalExtra(view, record));
     const loaded = await person.load(view);
+    const signal = person.signalOf(view, loaded, signalExtra(view, record));
     await loadExportLang(record.lang);
     const timeZone = zoneOf(view, record);
     const events = exportEvents({ ...loaded, me: record.email, role: view.role, lang: record.lang, timeZone, settings: view.settings, home: view.home?.address });
