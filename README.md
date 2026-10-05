@@ -216,8 +216,10 @@ The limits that shape it:
    a sync round or a feed build, in units of at most 6 subrequests (`UNIT_CALLS`) and 60 items
    (`UNIT_ITEMS`), each within the free plan's 10 ms of CPU:
    - `google` (sync): a page of Google's changes. `view`: the household and the person's settings,
-     and the lists' aggregations unless the check that found the change asked them in the last 10
-     minutes (kept on the person's row, `hh_counts`). `lists`: every kept copy in one D1 read, and
+     and the lists' aggregations. For an admin or member, the shared lists' aggregations are the
+     ones the check that found the change asked, when that was in the last 10 minutes (sealed on the
+     person's row, `hh_counts`); a helper's or kid's lists and the personal lists are counted again,
+     as the person. `lists`: every kept copy in one D1 read, and
      what changed. `split`: the signal (a sync with nothing to do ends here), Google's changes
      carried back, the lists cut into parts. `export`, a part a unit: its events as feed text and as
      Google writes. `feed`: the text put together, byte for byte what `exportIcs` writes of the

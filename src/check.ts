@@ -2,14 +2,13 @@ import { FirestoreError } from '@huishouden/pwa-kit/firestore-rest';
 import { FirebaseAuthError } from '@huishouden/pwa-kit/firebase-auth-rest';
 import type { Env, Fetch } from './env';
 import { log } from './log';
-import type { Tally } from './lists';
-import { seal, unseal } from './seal';
 import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
-import { eventRows, openPerson, savePerson, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
+import { eventRows, openPerson, savePerson, sealCounts, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
 import { FULL_EVERY_MS, isEcho } from './sync';
-import { dropFeed, FEED, markWork, SYNC } from './work';
+import { dropFeed, markWork } from './work';
+import { FEED, SYNC } from './round';
 
 /**
  * The cheap check, for a few people at a time (one fan-out invocation, src/tick.ts): has anything
@@ -217,23 +216,6 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
   return kinds | found;
 }
 
-/**
- * The household's shared lists as the check that marked the person's work counted them (an admin or
- * member: unfiltered), and whether to-dos were shown: a round's `view` reads the lists by them.
- */
-export interface HouseholdCounts {
-  at: number;
-  todos: boolean;
-  sharedAgenda: Tally;
-  /** The shared to-dos (null when to-dos are off). */
-  sharedTodos: Tally | null;
-}
-
-const countsKey = (pid: string) => `counts:${pid}`;
-
-export const sealCounts = (env: Env, pid: string, counts: HouseholdCounts): Promise<string> => seal(env.SEAL_KEY, countsKey(pid), counts);
-
-export const openCounts = (env: Env, pid: string, sealed: string | null): Promise<HouseholdCounts | null> => unseal<HouseholdCounts>(env.SEAL_KEY, countsKey(pid), sealed);
 
 /** The work due whatever the household did: a sync not fully rebuilt in FULL_EVERY_MS, a feed a request marked stale. */
 export function dueAnyway(row: Pick<CheckRow, 'full_at' | 'feed' | 'feed_stale'>, record: Pick<PersonRecord, 'feed'>, now: number, google: boolean): number {

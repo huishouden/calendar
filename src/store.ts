@@ -2,6 +2,7 @@ import type { Lang } from '@huishouden/pwa-kit/i18n';
 import { randomSecret, sha256 } from './b64';
 import type { Env } from './env';
 import { log } from './log';
+import type { Tally } from './lists';
 import { seal, unseal } from './seal';
 
 /**
@@ -153,7 +154,7 @@ export interface PersonRow {
   round: string | null;
   round_kind: number | null;
   round_at: number | null;
-  /** The aggregations the last check that marked work asked (src/check.ts `HouseholdCounts`, JSON). */
+  /** The household's shared lists' counts the last check that marked work asked (`HouseholdCounts`), sealed for `counts:<pid>`. */
   hh_counts: string | null;
 }
 
@@ -266,3 +267,23 @@ export async function dropFeed(env: Env, pid: string, now: number): Promise<void
   await upsertPersonRow(env, pid, { feed: 0 }, now);
   log('feed', { served: 'gone' });
 }
+
+// ---- The check's counts (src/check.ts, src/round.ts) ----
+
+/**
+ * The household's shared lists as the check that marked the person's work counted them (an admin or
+ * member: unfiltered), and whether to-dos were shown: a round's `view` reads the lists by them.
+ */
+export interface HouseholdCounts {
+  at: number;
+  todos: boolean;
+  sharedAgenda: Tally;
+  /** The shared to-dos (null when to-dos are off). */
+  sharedTodos: Tally | null;
+}
+
+const countsKey = (pid: string) => `counts:${pid}`;
+
+export const sealCounts = (env: Env, pid: string, counts: HouseholdCounts): Promise<string> => seal(env.SEAL_KEY, countsKey(pid), counts);
+
+export const openCounts = (env: Env, pid: string, sealed: string | null): Promise<HouseholdCounts | null> => unseal<HouseholdCounts>(env.SEAL_KEY, countsKey(pid), sealed);

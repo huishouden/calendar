@@ -9,12 +9,11 @@ import { globalFetch, type Env, type Fetch } from './env';
 import { log } from './log';
 import { loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type View } from './person';
 import { readLists, type Tally } from './lists';
-import { openCounts, type HouseholdCounts } from './check';
 import { seal, unseal } from './seal';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, rateLimited, reasonOf, SyncTokenGone, type BatchRequest, type GoogleEvent } from './google/api';
 import { applyEdit, dateFormatter, readChange, type Edit, type Written } from './backsync';
-import { clearRoundItems, deleteEventRow, dropFeed, feedStatements, personRowStatement, putEventRow, savePersonStatement, type EventRow, type PersonRecord, type PersonRow } from './store';
+import { clearRoundItems, deleteEventRow, dropFeed, feedStatements, openCounts, type HouseholdCounts, personRowStatement, putEventRow, savePersonStatement, type EventRow, type PersonRecord, type PersonRow } from './store';
 import { FULL_EVERY_MS, isEcho, MAX_WRITES, parseOverrides, planWrites, zeroCounts, type PlannedRequest, type PlannedRow, type SyncCounts } from './sync';
 
 /**
