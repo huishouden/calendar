@@ -6,13 +6,12 @@
   "type": "module",
   "scripts": {
     "lint": "tsc --noEmit && tsc --noEmit -p test",
-    "test": "bun test",
+    "test": "bunx firebase emulators:exec --only firestore --project demo-huishouden-calendar \"bun test\"",
     "seal-key": "bun scripts/seal-key.ts",
     "dev": "wrangler dev --test-scheduled",
     "deploy": "wrangler d1 migrations apply huishouden-calendar --remote && wrangler deploy",
     "deploy:staging": "wrangler d1 migrations apply huishouden-calendar-staging --remote --env staging && wrangler deploy --env staging",
-    "prepare": "git config core.hooksPath .githooks || true",
-    "test:emulator": "firebase emulators:exec --only firestore --project demo-huishouden-calendar \"bun test\""
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
     "@huishouden/pwa-kit": "github:huishouden/pwa-kit#v0.101.0"
