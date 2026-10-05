@@ -119,6 +119,9 @@ export interface PersonRow {
   lease_until: number | null;
   backoff_until: number | null;
   backoff: number;
+  /** The household side's signal at the last check that read it, and when it last changed (0: never seen changing). */
+  hh_signal: string | null;
+  hh_signal_at: number | null;
 }
 
 export interface EventRow {

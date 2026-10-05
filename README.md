@@ -75,7 +75,11 @@ record's purpose.
     needs the secret from the URL, so the Worker's key alone can't open it;
   - the sync state: which Google event stands for which agenda key, the hash and a snapshot of what
     was written, the etag our own write got back, Google's sync token;
-  - the work a check found, the lease of the unit working on it, and Google's back-off.
+  - the work a check found, the lease of the unit working on it, and Google's back-off;
+  - the household side's last signal and when it last changed (for how often it is read).
+- **D1** also holds the **lists a calendar is built from**, as last read (`src/lists.ts`), keyed by
+  a hash of household, collection and whose view (restricted or not; the member, for personal
+  lists), each sealed for its key. Copies unused for a week are deleted.
 - **KV** holds, per feed secret, whose it is, sealed the same way as the feed. KV keys are hashes.
 
 Nothing in D1 or KV is readable without the secrets.
@@ -198,6 +202,12 @@ The limits that shape it:
    each member's own signal. **When nothing changed, nothing is written**: no D1 row, no queue
    message. A chunk stops before its 50 subrequests, and the root gives the rest to another
    invocation.
+   - **A quiet household is read every 15 minutes.** Google's side is asked at every check (no
+     Firestore read); the household's side (about 6 billed reads) at every check only while the
+     person's signal changed in the last hour, otherwise at the first check of each quarter hour of
+     their slot (`householdDue`). A first change after a quiet spell reaches Google within 15
+     minutes, the ones after it within 5. Checks from a feed fetch or the portal always read it, and
+     a sync due anyway (6 hours since the last full one, a stale feed) is still marked.
 3. **The work** (`src/work.ts`): a check that finds a change marks it in D1 and sends **one queue
    message for the person** (never a second while one is on its way). The consumer takes one
    message per invocation (`max_batch_size = 1`). It does **one unit**: one round of the sync (up to
@@ -216,9 +226,21 @@ The limits that shape it:
 4. **Firestore's own quota**: a project on the free (Spark) plan has 50,000 reads a day for
    everything, the apps included. Once they are used up, every read fails until midnight Pacific
    time: the apps' too. `FIRESTORE_CHECK_READS` (`wrangler.toml`) is the share the checks may use,
-   at about 5 reads a check. Once an hour, the cron works out how often it can check everyone within
-   it (every 5, 10, 15, 20, 30 or 60 minutes) and checks less often rather than go over it. When
-   Firestore answers 429 anyway, the checks stop for 15 minutes.
+   at 6 billed reads a household-side check (`READS_PER_CHECK`: two documents and four
+   aggregations; an aggregation or a query is billed at least one read even when it finds nothing,
+   https://cloud.google.com/firestore/pricing "Minimum charge for queries"), counted for a quarter of
+   the day active (`googleChecksPerDay`). Once an hour, the cron works out how often it can check
+   everyone within it (every 5, 10, 15, 20, 30 or 60 minutes) and checks less often rather than go
+   over it. When Firestore answers 429 anyway, the checks stop for 15 minutes.
+5. **Loads read what changed** (`src/lists.ts`): a sync round or a feed build needs the four lists.
+   Each is kept in D1 between loads (sealed, per household and restricted flag for the shared
+   lists, per member for personal ones), and a load first asks its count and sum of `updatedAt`
+   (one aggregation). The same: the kept copy. Different, for an unfiltered list: only the
+   documents with a newer `updatedAt`, kept when the merged list matches the aggregation (a
+   deletion never does: then, and for filtered lists, the whole list). A copy a day old is read
+   whole again. A load with nothing changed costs 4 reads instead of every document (about 115 for
+   a busy household's agenda and to-dos), so the 6-hourly full rebuild (`FULL_EVERY_MS`) costs 4
+   reads when the lists are unchanged.
 
 ### What 1,000 people cost a day
 
@@ -236,23 +258,26 @@ once).
 | Durable Object duration | 4,320 alarms × ~2 s (waiting on their checks) × 128 MB | ~1,100 GB-s | 13,000 GB-s |
 | Subrequests per check invocation | 2 people × ~5 (change list, `batchGet`, 2 aggregations, a token now and then) + the household's shared 2 | ~12 | 50 |
 | Queue operations | 3,000 messages × 3 | **9,000** | 10,000 (more runs from the cron) |
-| D1 rows written | per change ~15 (mark, lease, person, ~2 events, release, feed; indexes included) × 3,000 = 45,000 + token after echoes 3,000 + ticks 1,440 + stale feeds 5,000 | **~55,000** | 100,000 |
+| D1 rows written | per change ~15 (mark, lease, person, ~2 events, release, feed; indexes included) × 3,000 = 45,000 + the signal seen changing 3,000 + kept lists ~2 per change 6,000 + token after echoes 3,000 + ticks 1,440 + stale feeds 5,000 | **~64,000** | 100,000 |
 | D1 rows read | roots 200 a minute × 1,440 = 288,000 (× 4 roots: each reads the minute's list) ~1.2 million + checks 288,000 + events read on echoes ~150,000 + syncs ~160,000 + fetches 24,000 | ~1.8 million | 5 million |
-| D1 storage | feeds ~40 KB sealed + ~50 events × ~1 KB, per person | ~90 MB | 5 GB |
+| D1 storage | feeds ~40 KB sealed + ~50 events × ~1 KB, per person; kept lists ~100 KB per household | ~150 MB | 5 GB |
 | KV | reads: none on the request path (only a feed with nothing stored); writes: one per feed set up or rotated | ~0 / ~10 | 100,000 / 1,000 |
 
 **Why the feeds are in D1, not KV:** 3,000 rebuilds a day (and 6,000 at 6 changes a day) would be
 3 to 6 times KV's 1,000 writes a day, while D1 allows 100,000 rows written. The Cache API is per
 data centre and can be evicted at any time, so a feed there would still need rebuilding in requests.
 
-**Firestore is the limit that bites first.** The checks cost about 5 reads each: 1,000 people every 5
-minutes is ~1.4 million reads a day, against 50,000 a day on the free Spark plan for everything. With
-`FIRESTORE_CHECK_READS = 20000` (40% of it), Spark keeps 5-minute checks for about 13 people with
-Google (20,000 ÷ (288 × 5)) or 40 with only a feed. Past that, the checks space out on their own,
-down to hourly. 1,000 people within 5 minutes of a change needs the project on Blaze: ~1.4 million
-reads a day is $0.40 to $0.80 a day after the free 50,000 ($0.03 to $0.06 per 100,000 reads,
-by the database's location). Then raise or unset
-`FIRESTORE_CHECK_READS`.
+**Firestore is the limit that bites first.** A household-side check costs about 6 billed reads, and
+a Google person gets about 144 a day (96 while quiet, every 15 minutes, plus every 5 minutes for the
+quarter of the day their household is active): 1,000 people is ~860,000 reads a day, against 50,000
+a day on the free Spark plan for everything. Loads add little: 3 changes × 2 loads (sync and feed)
+× ~6 reads (four aggregations and what changed) is ~36 a person, where reading every document was
+~700 (3 × 2 × ~115). With `FIRESTORE_CHECK_READS = 20000` (40% of the free reads), Spark keeps
+5-minute Google checks for about 23 people (20,000 ÷ (144 × 6)) or 34 with only a feed
+(20,000 ÷ (96 × 6)). Past that, the checks space out on their own, down to hourly. 1,000 people
+within 5 to 15 minutes of a change needs the project on Blaze: ~860,000 reads a day is $0.25 to $0.50
+a day after the free 50,000 ($0.03 to $0.06 per 100,000 reads, by the database's location). Then
+raise or unset `FIRESTORE_CHECK_READS`.
 
 ## Spending's alert inboxes
 
@@ -371,8 +396,11 @@ limit is the binding one: 100 accounts while the app is unverified.
 - **A change reaches Google within 5 minutes**, plus a few seconds for the work: the check that
   notices it runs every 5 minutes (longer only when Firestore's read budget asks, see "Many
   households"), and the work runs within seconds of it.
-- **Firestore's free tier**: a check costs about 5 reads. A feed build or a sync round reads the
-  person's agenda, a few hundred documents. When the project's daily quota is used up (Spark: 50,000
+- **Firestore's free tier**: a household-side check costs about 6 billed reads (every 15 minutes
+  while the household is quiet, every 5 while it changes). A feed build or a sync round costs 4
+  aggregation reads plus what changed (`src/lists.ts`); the whole list (a few hundred documents in a
+  busy household) only when something was deleted, for a helper's or kid's or a personal list that
+  changed, or once a day. When the project's daily quota is used up (Spark: 50,000
   reads), Firestore answers 429 until midnight Pacific time: the portal's calls get 503
   `firestore-quota` (the portal says so, rather than "couldn't reach"), feeds serve what is stored,
   and the checks pause.

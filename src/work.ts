@@ -158,7 +158,7 @@ export async function buildFeed(env: Env, pid: string, deps: WorkDeps & { record
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
   try {
     const view = await person.view();
-    const loaded = await person.load(view);
+    const loaded = await person.load(view, now);
     const signal = person.signalOf(view, loaded, signalExtra(view, record));
     await loadExportLang(record.lang);
     const timeZone = zoneOf(view, record);
