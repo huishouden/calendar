@@ -9,8 +9,6 @@ import type { Env, Fetch } from './env';
 import type { PersonRecord } from './store';
 import { listKey, readList, tallyOf, type ListOutcome, type ListReads, type Tally } from './lists';
 
-export { tallyOf, type Tally } from './lists';
-
 /**
  * Acting as the person: their Firebase refresh token buys ID tokens, and every Firestore call
  * carries one, so the household's rules decide what is read and written, exactly as in the apps.
@@ -72,6 +70,8 @@ export interface Loaded {
   todos: TodoItem[];
   /** Each list's count and sum of `updatedAt`, as the signal's aggregations would say: the signal without asking again. */
   tally: Tally[];
+  /** How each list was read (src/lists.ts): the kept copy, what changed, or all of it. */
+  reads: Record<string, ListOutcome>;
 }
 
 export const roleOf = (data: Record<string, unknown>, email: string): Role => {
@@ -87,7 +87,7 @@ export const roleOf = (data: Record<string, unknown>, email: string): Role => {
  * each of them: the shared lists' count and sum are the same query whoever of them asks, and only
  * ever go into each member's own change signal.
  */
-export type Shared = Map<string, Promise<{ count: number; sums: Record<string, number> }>>;
+export type Shared = Map<string, Promise<Tally>>;
 
 export class Person {
   readonly db: FirestoreRest;
@@ -231,33 +231,32 @@ export class Person {
    * from what changed or the whole list (src/lists.ts).
    */
   async load(view: View, now = Date.now()): Promise<Loaded> {
-    const list = async (collection: string, where: FieldFilter[], scope: string): Promise<Doc[]> => {
-      const reads: ListReads = {
+    const reads: Record<string, ListOutcome> = {};
+    // The copy's key is the query itself: only people whose query is the same share one.
+    const list = async (collection: string, where: FieldFilter[]): Promise<Doc[]> => {
+      const ask: ListReads = {
         tally: () => this.db.aggregate(this.base, collection, { where }, ['updatedAt']),
         all: () => this.db.query(this.base, collection, { where }),
         // Only an unfiltered list: a filter and a range on `updatedAt` together need an index of their own.
         ...(where.length ? {} : { since: (after: number) => this.db.query(this.base, collection, { where: [{ field: 'updatedAt', op: 'GREATER_THAN', value: after }] }) }),
       };
-      const { docs, outcome } = await readList(this.env, await listKey(this.record.household, collection, scope), reads, now);
-      this.outcomes.push({ collection, outcome });
+      const { docs, outcome } = await readList(this.env, await listKey(this.record.household, collection, JSON.stringify(where)), ask, now);
+      reads[collection] = outcome;
       return docs;
     };
-    const sharedScope = view.restricted ? 'restricted' : 'all';
     const [agenda, personal, todos, personalTodos] = await Promise.all([
-      list('agenda', this.shared(view), sharedScope),
-      this.optional(() => list(PERSONAL_AGENDA, this.mine(view), view.email), []),
-      view.settings.todos ? list('todos', this.shared(view), sharedScope) : Promise.resolve([]),
-      view.settings.todos ? this.optional(() => list(PERSONAL_TODOS, this.mine(view), view.email), []) : Promise.resolve([]),
+      list('agenda', this.shared(view)),
+      this.optional(() => list(PERSONAL_AGENDA, this.mine(view)), []),
+      view.settings.todos ? list('todos', this.shared(view)) : Promise.resolve([]),
+      view.settings.todos ? this.optional(() => list(PERSONAL_TODOS, this.mine(view)), []) : Promise.resolve([]),
     ]);
     return {
       tally: [agenda, personal, todos, personalTodos].map(tallyOf),
+      reads,
       agenda: [...agenda, ...personal].map((d) => ({ ...toAgendaItem(d.id, d.data), ...(d.path.includes(`/${PERSONAL_AGENDA}/`) ? { audience: toAgendaItem(d.id, d.data).audience ?? [] } : {}) })),
       todos: [...todos, ...personalTodos].map((d) => toTodoItem(d.id, d.data)),
     };
   }
-
-  /** How each list of this person's loads was read (for tests and the log). */
-  readonly outcomes: { collection: string; outcome: ListOutcome }[] = [];
 }
 
 const signalFrom = (view: View, tallies: Tally[], extra: string): string =>

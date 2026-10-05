@@ -1,6 +1,8 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
-import { checkPeople, householdDue, ACTIVE_MS, QUIET_EVERY_MIN } from '../src/check';
+import { checkPeople, dueAnyway, householdDue, ACTIVE_MS, QUIET_EVERY_MIN } from '../src/check';
+import { FULL_EVERY_MS } from '../src/sync';
+import { FEED, SYNC } from '../src/work';
 import { Person } from '../src/person';
 import { LIST_MAX_AGE_MS } from '../src/lists';
 import { loadPerson, personId } from '../src/store';
@@ -25,7 +27,7 @@ async function load(email: string, now = w.clock.now) {
   const p = person(email);
   const view = await p.view();
   const loaded = await p.load(view, now);
-  return { loaded, how: Object.fromEntries(p.outcomes.map((o) => [o.collection, o.outcome])) as Record<string, string>, p, view };
+  return { loaded, how: loaded.reads as Record<string, string>, p, view };
 }
 const agendaPath = `households/${household}/agenda/baby_appointment_a1`;
 
@@ -35,7 +37,7 @@ describe('lists kept between loads', () => {
     expect(first.how.agenda).toBe('full');
     const again = await load('alice@example.com');
     expect(again.how).toEqual(Object.fromEntries(Object.keys(first.how).map((k) => [k, 'kept'])));
-    expect(again.loaded).toEqual(first.loaded);
+    expect({ ...again.loaded, reads: {} }).toEqual({ ...first.loaded, reads: {} });
     // The signal from a kept load is still the aggregations' own.
     expect(again.p.signalOf(again.view, again.loaded, 'x')).toBe(await again.p.signal(again.view, 'x'));
   });
@@ -76,6 +78,31 @@ describe('lists kept between loads', () => {
     expect((await load('alice@example.com')).how.agenda).toBe('delta');
   });
 
+  test('a kid shares the helper’s copy (the same query), never a member’s private items', async () => {
+    await load('alice@example.com');
+    await load('helen@example.com');
+    const kid = await load('kim@example.com');
+    expect(kid.how.agenda).toBe('kept');
+    expect(kid.loaded.agenda.some((i) => i.app === 'bills' || i.private)).toBe(false);
+  });
+
+  test('a personal list is each member’s own: taken off an item’s audience, it is gone at the next load', async () => {
+    const path = `households/${household}/personalAgenda/health_dose`;
+    const before = await readDoc(path);
+    expect(before).not.toBeNull();
+    const audience = before!.audience as string[];
+    const carer = audience[0];
+    const first = await load(carer);
+    expect(first.loaded.agenda.some((i) => i.id === 'health_dose')).toBe(true);
+    // Someone not named never gets it, kept or not.
+    const other = ['alice@example.com', 'bob@example.com', 'cora@example.com'].find((e) => !audience.includes(e))!;
+    expect((await load(other)).loaded.agenda.some((i) => i.id === 'health_dose')).toBe(false);
+    await writeDoc(path, { ...before!, audience: audience.filter((e) => e !== carer).length ? audience.filter((e) => e !== carer) : ['nobody@example.com'], updatedAt: w.clock.now + MIN });
+    const after = await load(carer);
+    expect(after.how.personalAgenda).toBe('full');
+    expect(after.loaded.agenda.some((i) => i.id === 'health_dose')).toBe(false);
+  });
+
   test('a copy a day old is read whole again', async () => {
     await load('alice@example.com');
     expect((await load('alice@example.com', w.clock.now + LIST_MAX_AGE_MS - MIN)).how.agenda).toBe('kept');
@@ -105,6 +132,15 @@ describe('a quiet household is read every 15 minutes', () => {
     expect(householdDue({ ...row, hh_signal: null }, base + 5 * MIN, 5)).toBe(true);
     expect(householdDue(row, base + 5 * MIN, QUIET_EVERY_MIN)).toBe(true);
     expect(householdDue(row, base + 5 * MIN, undefined)).toBe(true);
+  });
+
+  test('a quiet check still marks what is due anyway: a sync not rebuilt in 6 hours, a stale feed', () => {
+    const now = Date.parse('2031-10-01T12:00:00Z');
+    const fresh = { full_at: now - MIN, feed: 1, feed_stale: 0 };
+    expect(dueAnyway(fresh, { feed: { secret: 's', createdAt: 0 } }, now, true)).toBe(0);
+    expect(dueAnyway({ ...fresh, full_at: now - FULL_EVERY_MS - MIN }, {}, now, true)).toBe(SYNC);
+    expect(dueAnyway({ ...fresh, full_at: null }, {}, now, false)).toBe(0);
+    expect(dueAnyway({ ...fresh, feed_stale: 1 }, { feed: { secret: 's', createdAt: 0 } }, now, true)).toBe(FEED);
   });
 
   test('the cron’s checks: Google every time, Firestore once in 15 minutes while quiet, and a change still arrives', async () => {
