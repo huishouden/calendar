@@ -2,6 +2,7 @@ import type { Env, Fetch } from './env';
 import { log } from './log';
 import { checkPeople, QUIET_EVERY_MIN, type CheckTotals } from './check';
 import { forgetLists } from './lists';
+import { forgetRounds } from './store';
 import { markWork, REQUEUE_MS, runWork, type WorkOutcome } from './work';
 
 /**
@@ -199,7 +200,10 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
   }
 
   // Kept lists nobody has used for a week (src/lists.ts), once an hour.
-  if (part === 0 && minute === 0) await forgetLists(env, now).catch(() => undefined);
+  if (part === 0 && minute === 0) {
+    await forgetLists(env, now).catch(() => undefined);
+    await forgetRounds(env, now).catch(() => undefined);
+  }
 
   // The portal's "Updated ... ago" for everyone checked in this minute, when all of them were.
   if (!failed && !paused && totals.deferred === 0) {

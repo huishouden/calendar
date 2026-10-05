@@ -3,13 +3,14 @@ import { exportEvents, exportIcs, loadExportLang, type ExportEvent } from '@huis
 import { icsProblems } from '@huishouden/pwa-kit/ics';
 import { handleApi } from '../src/api';
 import { Person } from '../src/person';
-import { assembleIcs, eventIcs, keepWitness, partition, ROUND_MAX_MS, UNIT_CALLS, UNIT_ITEMS } from '../src/round';
+import { ROUND_MAX_MS, UNIT_CALLS } from '../src/round';
+import { assembleIcs, eventIcs, keepWitness, partition, UNIT_ITEMS } from '../src/parts';
 import { MAX_WRITES } from '../src/sync';
 import { FEED, MAX_CHAIN, runWork, SYNC, markWork, type Handover } from '../src/work';
 import { checkPeople } from '../src/check';
 import { loadPerson, openFeedBody, personId } from '../src/store';
 import { captureLogs } from '../src/log';
-import { apiRequest, drain, household, refreshFor, resetFirestore, seed, world, TZ, type World } from './helpers/world';
+import { apiRequest, drain, household, readDoc, refreshFor, resetFirestore, seed, world, TZ, type World } from './helpers/world';
 
 // A feed build and a sync round go in units (src/round.ts), each within the free plan's 10 ms of
 // CPU: a bounded number of subrequests and of items. Cut up, they come to exactly what the whole
@@ -220,7 +221,7 @@ describe('a busy household, in units', () => {
     expect(w.google.live((await loadPerson(w.env, pid))!.google!.calendarId).filter((e) => e.summary?.startsWith('Visit ')).length).toBe(120);
   });
 
-  test('after a check: the round reads the lists by the aggregations the check asked, not asking them again', async () => {
+  test('after a check: the shared lists by the counts the check asked; the personal ones asked again, as the person', async () => {
     await busy({ series: 2, singles: 30, todos: 0 });
     await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
     await drain(w);
@@ -228,16 +229,60 @@ describe('a busy household, in units', () => {
     await seed({ 'households/h1/agenda/baby_appointment_x3': { app: 'baby', ref: 'appointment:x3', kind: 'appointment', title: 'Moved visit', start: Date.parse('2031-10-09T10:00:00Z'), end: Date.parse('2031-10-09T11:00:00Z'), allDay: false, url: 'https://huishouden-piekstra.web.app/baby/', private: false, updatedAt: w.clock.now + MIN, by: 'bob@example.com' } });
     w.clock.now += 2 * MIN;
     const asked: string[] = [];
-    const counting = (url: string, init?: RequestInit) => (url.includes(':runAggregationQuery') && asked.push(url), w.fetch(url, init));
+    const counting = (url: string, init?: RequestInit) => {
+      if (url.includes(':runAggregationQuery')) asked.push(String(init?.body ?? ''));
+      return w.fetch(url, init);
+    };
     expect((await checkPeople(w.env, [pid], { fetch: counting, now: w.clock.now })).marked).toBe(1);
-    const byCheck = asked.length;
-    expect(byCheck).toBeGreaterThan(0);
+    // Sealed on the row: no counts readable in D1.
+    expect((await w.env.DB.prepare('SELECT hh_counts FROM people WHERE pid = ?').bind(pid).first<{ hh_counts: string }>())!.hh_counts).toMatch(/^v1\./);
+    asked.length = 0;
     w.queue.length = 0;
     await runWork(w.env, pid, { fetch: counting, now: w.clock.now, next: (p, h) => runWork(w.env, p, { fetch: counting, now: w.clock.now, handover: h, next: (q, k) => w.env.SELF!.work(q, k) }) });
     await drain(w);
-    expect(asked.length).toBe(byCheck);
+    // Only the personal lists (agenda and to-dos) were counted again.
+    expect(asked.length).toBe(2);
+    expect(asked.every((b) => b.includes('personal'))).toBe(true);
     const body = await openFeedBody(w.env, (await loadPerson(w.env, pid))!.feed!.secret, (await w.env.DB.prepare('SELECT body FROM feeds WHERE pid = ?').bind(pid).first<{ body: string }>())!.body);
     expect(body).toContain('SUMMARY:Moved visit');
+  });
+
+  /** Sets up `email`'s feed, then a change any member sees, found by a check; returns the person and their feed. */
+  async function checked(email: string) {
+    await call('/api/feed', email, { household, refreshToken: refreshFor(email), lang: 'en', timeZone: TZ });
+    await drain(w);
+    const pid = await personId(household, email);
+    const path = 'households/h1/agenda/baby_appointment_a1';
+    await seed({ [path]: { ...(await readDoc(path))!, title: 'Checkup at 18 months', updatedAt: w.clock.now + MIN } });
+    w.clock.now += 2 * MIN;
+    expect((await checkPeople(w.env, [pid], { now: w.clock.now, fetch: w.fetch })).marked).toBe(1);
+    w.queue.length = 0;
+    const feed = async () => {
+      await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now, next: (p, h) => w.env.SELF!.work(p, h) });
+      await drain(w);
+      const row = (await w.env.DB.prepare('SELECT body FROM feeds WHERE pid = ?').bind(pid).first<{ body: string }>())!;
+      return (await openFeedBody(w.env, (await loadPerson(w.env, pid))!.feed!.secret, row.body))!;
+    };
+    return { pid, feed };
+  }
+
+  test('a helper: an item made private between the check and the round is not in their feed', async () => {
+    const { feed } = await checked('helen@example.com');
+    // After the check, an admin makes the checkup private.
+    const path = 'households/h1/agenda/baby_appointment_a1';
+    await seed({ [path]: { ...(await readDoc(path))!, private: true, updatedAt: w.clock.now } });
+    const body = await feed();
+    expect(body).not.toContain('Checkup');
+    expect(body).toContain('SUMMARY:Garbage pickup');
+  });
+
+  test('a carer dropped from a Health item between the check and the round: not in their feed', async () => {
+    const { feed } = await checked('cora@example.com');
+    const path = 'households/h1/personalAgenda/health_dose';
+    await seed({ [path]: { ...(await readDoc(path))!, audience: ['alice@example.com'], updatedAt: w.clock.now } });
+    const body = await feed();
+    expect(body).not.toContain('Medicine for Nan');
+    expect(body).toContain('SUMMARY:Checkup at 18 months');
   });
 
   test('an invocation lost after its writes: the unit runs again, adding nothing twice; the feed as from the whole', async () => {

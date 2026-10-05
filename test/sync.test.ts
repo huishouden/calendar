@@ -1,8 +1,8 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
-import { syncPerson, MAX_WRITES } from '../src/sync';
+import { MAX_WRITES } from '../src/sync';
 import { runCron, runPart, nextAlarm, pack, periodsFor, CHUNK, CAPACITY, slotsFor, GOOGLE_EVERY_MIN, FEED_EVERY_MIN, MAX_CALLS, READS_PER_CHECK, googleChecksPerDay } from '../src/tick';
-import { runWork, SYNC, FEED, markWork, MAX_CHAIN } from '../src/work';
+import { runWork, SYNC, FEED, markWork, MAX_CHAIN, syncPerson } from '../src/work';
 import { checkPeople } from '../src/check';
 import { personId, loadPerson } from '../src/store';
 import { eventId, instanceId } from '../src/google/events';

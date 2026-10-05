@@ -4,7 +4,7 @@ import { decodeFields, encodeFields } from '@huishouden/pwa-kit/firestore-rest';
 import { batchBody, parseBatch } from './google/api';
 import { googleBody } from './google/events';
 import { snapshot } from './backsync';
-import { assembleIcs, eventIcs, keepWitness, partition } from './round';
+import { assembleIcs, eventIcs, keepWitness, partition } from './parts';
 
 /** Zones warmed at startup: the runtime's zone data for each, used by the VTIMEZONE and the clock. */
 const ZONES = ['Europe/Amsterdam', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'UTC'];

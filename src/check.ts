@@ -3,6 +3,7 @@ import { FirebaseAuthError } from '@huishouden/pwa-kit/firebase-auth-rest';
 import type { Env, Fetch } from './env';
 import { log } from './log';
 import type { Tally } from './lists';
+import { seal, unseal } from './seal';
 import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
@@ -183,13 +184,16 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
   }
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
   let signal: string;
-  let counts: string;
+  let counts: string | null;
   try {
     const view = await person.view();
     const read = await person.signalAndCounts(view, signalExtra(view, record), shared);
     signal = read.signal;
-    // What a round's first unit would ask again (src/round.ts `view`), kept with the signal.
-    counts = JSON.stringify({ at: now, restricted: view.restricted, todos: view.settings.todos, counts: read.counts } satisfies HouseholdCounts);
+    // What a round's first unit would ask again (src/round.ts `view`), kept with the signal, sealed:
+    // the household's shared lists as an admin or member counts them (all of them), never a
+    // helper's or kid's (what the rules let them see may change before the round) nor anyone's
+    // personal lists; the round asks those again as the person.
+    counts = view.restricted ? null : await sealCounts(env, row.pid, { at: now, todos: view.settings.todos, sharedAgenda: read.counts[0]!, sharedTodos: read.counts[2] });
   } catch (e) {
     if (e instanceof NotMember) {
       if (record.feed) await dropFeed(env, row.pid, now);
@@ -213,13 +217,23 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
   return kinds | found;
 }
 
-/** The aggregations a check asked for the person, by slot (src/person.ts `signalAndCounts`), and for which view. */
+/**
+ * The household's shared lists as the check that marked the person's work counted them (an admin or
+ * member: unfiltered), and whether to-dos were shown: a round's `view` reads the lists by them.
+ */
 export interface HouseholdCounts {
   at: number;
-  restricted: boolean;
   todos: boolean;
-  counts: (Tally | null)[];
+  sharedAgenda: Tally;
+  /** The shared to-dos (null when to-dos are off). */
+  sharedTodos: Tally | null;
 }
+
+const countsKey = (pid: string) => `counts:${pid}`;
+
+export const sealCounts = (env: Env, pid: string, counts: HouseholdCounts): Promise<string> => seal(env.SEAL_KEY, countsKey(pid), counts);
+
+export const openCounts = (env: Env, pid: string, sealed: string | null): Promise<HouseholdCounts | null> => unseal<HouseholdCounts>(env.SEAL_KEY, countsKey(pid), sealed);
 
 /** The work due whatever the household did: a sync not fully rebuilt in FULL_EVERY_MS, a feed a request marked stale. */
 export function dueAnyway(row: Pick<CheckRow, 'full_at' | 'feed' | 'feed_stale'>, record: Pick<PersonRecord, 'feed'>, now: number, google: boolean): number {

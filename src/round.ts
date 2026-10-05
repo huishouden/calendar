@@ -1,5 +1,6 @@
-import { contentHash, exportEvents, exportIcs, loadExportLang, toIcsEvents, visibleTo, type ExportEvent, type ExportInput } from '@huishouden/pwa-kit/calendar-export';
-import { CRLF, foldLine, icsProblems, veventLines } from '@huishouden/pwa-kit/ics';
+import { contentHash, exportEvents, loadExportLang, type ExportEvent, type ExportInput } from '@huishouden/pwa-kit/calendar-export';
+import { icsProblems } from '@huishouden/pwa-kit/ics';
+import { assembleIcs, eventIcs, keepWitness, partition, UNIT_ITEMS, type Piece } from './parts';
 import type { AgendaItem } from '@huishouden/pwa-kit/agenda-core';
 import type { TodoItem } from '@huishouden/pwa-kit/todo-core';
 import type { Doc } from '@huishouden/pwa-kit/firestore-rest';
@@ -8,13 +9,13 @@ import { globalFetch, type Env, type Fetch } from './env';
 import { log } from './log';
 import { loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type View } from './person';
 import { readLists, type Tally } from './lists';
-import type { HouseholdCounts } from './check';
+import { openCounts, type HouseholdCounts } from './check';
 import { seal, unseal } from './seal';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, rateLimited, reasonOf, SyncTokenGone, type BatchRequest, type GoogleEvent } from './google/api';
 import { applyEdit, dateFormatter, readChange, type Edit, type Written } from './backsync';
-import { deleteEventRow, dropFeed, feedStatements, personRowStatement, putEventRow, savePerson, type EventRow, type PersonRecord, type PersonRow } from './store';
-import { FULL_EVERY_MS, isEcho, MAX_WRITES, planWrites, type PlannedRequest, type PlannedRow, type SyncCounts } from './sync';
+import { clearRoundItems, deleteEventRow, dropFeed, feedStatements, personRowStatement, putEventRow, savePersonStatement, type EventRow, type PersonRecord, type PersonRow } from './store';
+import { FULL_EVERY_MS, isEcho, MAX_WRITES, parseOverrides, planWrites, zeroCounts, type PlannedRequest, type PlannedRow, type SyncCounts } from './sync';
 
 /**
  * A feed build or a sync round, in units small enough for the free plan's 10 ms of CPU each
@@ -28,7 +29,8 @@ import { FULL_EVERY_MS, isEcho, MAX_WRITES, planWrites, type PlannedRequest, typ
  * - `google` (sync): one page of what changed in Google; echoes of our own writes dropped.
  * - `view`: the household and the person's settings in one request, and each list's count and sum
  *   of `updatedAt` (the change signal's aggregations).
- * - `view` uses the aggregations the check that found the change asked, when they are fresh.
+ *   For an admin or member, the shared lists' aggregations are the ones the check that found the
+ *   change asked, when they are fresh; anything the rules filter is asked again as the person.
  * - `lists`: every kept copy in one D1 read and from Firestore only what changed (src/lists.ts).
  * - `split`: the kept copies again, in one D1 read; the signal (a sync with nothing to do ends
  *   here); Google's changes carried back (then the lists again); the lists cut into parts.
@@ -39,8 +41,6 @@ import { FULL_EVERY_MS, isEcho, MAX_WRITES, planWrites, type PlannedRequest, typ
  *   Google a unit, deletions first. The last records the round.
  */
 
-/** Items (agenda items and to-dos) one unit exports at most. */
-export const UNIT_ITEMS = 60;
 /** Subrequests (Firestore, Google, D1) one unit makes at most, besides its lease and its batch. */
 export const UNIT_CALLS = 6;
 /** A round not finished in this long starts again (what it planned is out of date). */
@@ -48,14 +48,16 @@ export const ROUND_MAX_MS = 30 * 60_000;
 /** Writes (and rows) kept on the person's row while they are this few; more go to `round_items`. */
 const ROW_WRITES = 20;
 
-export type RoundKind = 1 | 2;
+export const FEED = 1 as const;
+export const SYNC = 2 as const;
+export type RoundKind = typeof FEED | typeof SYNC;
 type Step = 'google' | 'view' | 'lists' | 'split' | 'export' | 'feed' | 'deletes' | 'write';
 
 /** The most subrequests each step makes, for chaining steps within a unit. */
 const STEP_CALLS: Record<Step, number> = { google: 3, view: 5, lists: 3, split: 5, export: 2, feed: 1, deletes: 1, write: 3 };
 
-/** The next step's subrequests at most: `view` is one when the check's aggregations are fresh. */
-const stepCalls = (ctx: Ctx): number => (ctx.state.step === 'view' && freshCounts(ctx) ? 1 : STEP_CALLS[ctx.state.step]);
+/** The next step's subrequests at most. */
+const stepCalls = (ctx: Ctx): number => STEP_CALLS[ctx.state.step];
 
 interface PendingEdits {
   /** The Google event the edits came from (its id), and the key of the event it stands for. */
@@ -74,12 +76,6 @@ interface WriteItem {
   /** The row as it was when planned: its etag and moved occurrences' etags carry over. */
   etag: string | null;
   overrides: string | null;
-}
-
-interface Piece {
-  s: number;
-  k: string;
-  t: string;
 }
 
 export interface RoundState {
@@ -148,18 +144,17 @@ export interface RoundDeps {
   round?: string | null;
 }
 
-export const zeroCounts = (): SyncCounts => ({ changes: 0, echoes: 0, applied: 0, refused: 0, conflicts: 0, hidden: 0, inserted: 0, updated: 0, deleted: 0, failed: 0, limited: 0, requests: 0, full: false, more: false });
 
 const purpose = (pid: string) => `round:${pid}`;
 
 function fresh(kind: RoundKind, now: number, row: PersonRow, record: PersonRecord): RoundState {
   return {
     kind,
-    feed: kind === 2 && !!(row.work & 1) && !!record.feed && row.feed === 1,
-    step: kind === 2 ? 'google' : 'view',
+    feed: kind === SYNC && !!(row.work & FEED) && !!record.feed && row.feed === 1,
+    step: kind === SYNC ? 'google' : 'view',
     started: now,
     reads: {},
-    ...(kind === 2 ? { fromToken: row.sync_token } : {}),
+    ...(kind === SYNC ? { fromToken: row.sync_token } : {}),
     real: [],
     editAt: 0,
     forced: [],
@@ -246,7 +241,9 @@ export async function savedRound(env: Env, pid: string, row: PersonRow, kind: Ro
 /**
  * One unit of the person's round of `kind`, carrying on from the round on their row or starting
  * one. Reads go to D1 as it works; its writes come back as `statements` and `round` for the
- * caller's batch, so a unit that fails part way leaves the round where it was.
+ * caller's batch, so a unit that fails part way leaves the round where it was. One exception: a
+ * person who left the household loses their feed at once (`dropFeed`: its KV record can't join a
+ * D1 batch; doing it again is harmless).
  */
 export async function runUnit(env: Env, pid: string, kind: RoundKind, row: PersonRow, record: PersonRecord, deps: RoundDeps = {}): Promise<UnitResult> {
   const now = deps.now ?? Date.now();
@@ -261,7 +258,7 @@ export async function runUnit(env: Env, pid: string, kind: RoundKind, row: Perso
   let state = await savedRound(env, pid, row, kind, now, deps.round);
   if (!state) {
     // A new round: whatever an old one left goes.
-    if (row.round || deps.round) statements.push(env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(pid));
+    if (row.round || deps.round) statements.push(clearRoundItems(env, pid));
     state = fresh(kind, now, row, record);
   }
   const ctx: Ctx = { env: cenv, pid, row, record, state, now, fetch: fetchImpl, firestoreUrl: deps.firestoreUrl, statements, calls, limited: false, memo: {} };
@@ -274,7 +271,7 @@ export async function runUnit(env: Env, pid: string, kind: RoundKind, row: Perso
     if (next !== 'continue' || ctx.limited || calls.n + stepCalls(ctx) > UNIT_CALLS) break;
   }
   const done = next === 'done';
-  if (done && state.items) statements.push(env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(pid));
+  if (done && state.items) statements.push(clearRoundItems(env, pid));
   return {
     done,
     step: ran.join('+'),
@@ -282,7 +279,7 @@ export async function runUnit(env: Env, pid: string, kind: RoundKind, row: Perso
     statements,
     round: done ? null : await seal(env.SEAL_KEY, purpose(pid), state),
     started: state.started,
-    finished: done ? kind | (state.feed ? 1 : 0) : 0,
+    finished: done ? kind | (state.feed ? FEED : 0) : 0,
     counts: state.counts,
     calls: calls.n,
   };
@@ -301,7 +298,7 @@ const STEPS: Record<Step, (ctx: Ctx) => Promise<Next>> = {
 
 const person = (ctx: Ctx) => new Person(ctx.env, ctx.record, ctx.fetch, ctx.firestoreUrl);
 
-const isSync = (ctx: Ctx) => ctx.state.kind === 2;
+const isSync = (ctx: Ctx) => ctx.state.kind === SYNC;
 /** Whether the round builds the feed: a feed round, or a sync round that does both. */
 const buildsFeed = (ctx: Ctx) => !isSync(ctx) || ctx.state.feed;
 
@@ -342,7 +339,7 @@ const opened = <T>(ctx: Ctx, sealed: string | undefined): Promise<T | null> => u
 /** The round from the top: something it handed on is gone (another round replaced it). */
 function restart(ctx: Ctx): Next {
   Object.assign(ctx.state, fresh(ctx.state.kind, ctx.now, ctx.row, ctx.record));
-  ctx.statements.push(ctx.env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(ctx.pid));
+  ctx.statements.push(clearRoundItems(ctx.env, ctx.pid));
   return 'yield';
 }
 
@@ -369,8 +366,7 @@ async function googleStep(ctx: Ctx): Promise<Next> {
     }
     if (e instanceof CalendarApiError && e.status === 404) {
       // They deleted the Huishouden calendar in Google: stop syncing until they connect again.
-      await savePerson(env, pid, { ...record, google: undefined });
-      ctx.statements.push(env.DB.prepare('DELETE FROM events WHERE pid = ?').bind(pid));
+      ctx.statements.push(await savePersonStatement(env, pid, { ...record, google: undefined }), env.DB.prepare('DELETE FROM events WHERE pid = ?').bind(pid));
       return syncEnds(ctx, { google: 0, last_error: 'calendar-deleted', sync_token: null });
     }
     throw e;
@@ -398,7 +394,7 @@ async function googleStep(ctx: Ctx): Promise<Next> {
 
 // ---- view, lists: the person's view and lists ----
 
-/** The check's aggregations are used for a round that starts within this long of them. */
+/** The check's counts are used for a round that starts within this long of them. */
 export const COUNTS_MAX_MS = 10 * 60_000;
 
 async function viewStep(ctx: Ctx): Promise<Next> {
@@ -411,34 +407,23 @@ async function viewStep(ctx: Ctx): Promise<Next> {
   }
   const view = state.view;
   const specs = p.listSpecs(view);
-  // The check that found the change asked these moments ago, for the same view: not again.
-  const checked = freshCounts(ctx);
-  if (checked && checked.restricted === view.restricted && checked.todos === view.settings.todos) {
-    state.tallies = checked.counts;
-    state.step = 'lists';
-    // The lists (and the split with them) are a unit's work of their own.
-    return 'yield';
-  }
-  const counted = await Promise.all(specs.map((s) => p.countOf(s)));
+  // The household's shared lists as the check that found the change counted them moments ago, for
+  // an admin or member (who read all of them). Anything the rules filter (a helper's or kid's
+  // lists, a personal list's audience) is counted again, now, as the person.
+  const checked = await freshCounts(ctx);
+  const shared = checked && !view.restricted && checked.todos === view.settings.todos ? checked : null;
+  const counted = await Promise.all(specs.map((s) => (shared && s.slot === 0 ? shared.sharedAgenda : shared && s.slot === 2 ? shared.sharedTodos : p.countOf(s))));
   state.tallies = [null, null, null, null];
   specs.forEach((s, i) => (state.tallies![s.slot] = counted[i]));
   state.step = 'lists';
   return 'yield';
 }
 
-/** The check's aggregations on the person's row, when they are recent and nothing has changed the records since. */
-function freshCounts(ctx: Ctx): HouseholdCounts | null {
-  const c = parseCounts(ctx.row.hh_counts);
-  return c && ctx.now - c.at < COUNTS_MAX_MS && c.at <= ctx.now && ctx.state.counts.applied === 0 ? c : null;
-}
-
-function parseCounts(text: string | null): HouseholdCounts | null {
-  try {
-    const c = text ? (JSON.parse(text) as HouseholdCounts) : null;
-    return c && Array.isArray(c.counts) && c.counts.length === 4 ? c : null;
-  } catch {
-    return null;
-  }
+/** The check's counts on the person's row, when they are recent and nothing has changed the records since. */
+async function freshCounts(ctx: Ctx): Promise<HouseholdCounts | null> {
+  if (!ctx.row.hh_counts || ctx.state.counts.applied) return null;
+  const c = await openCounts(ctx.env, ctx.pid, ctx.row.hh_counts);
+  return c && ctx.now - c.at < COUNTS_MAX_MS && c.at <= ctx.now ? c : null;
 }
 
 async function viewFailed(ctx: Ctx, e: unknown): Promise<Next> {
@@ -449,7 +434,7 @@ async function viewFailed(ctx: Ctx, e: unknown): Promise<Next> {
     return 'done';
   }
   if (signInGone(e)) {
-    await savePerson(env, pid, { ...record, signedOut: true });
+    ctx.statements.push(await savePersonStatement(env, pid, { ...record, signedOut: true }));
     if (isSync(ctx)) return syncEnds(ctx, { last_error: 'signed-out' });
     log('feed', { built: false, reason: 'signed-out' });
     return 'done';
@@ -492,47 +477,6 @@ const exportInput = (ctx: Ctx): Omit<ExportInput, 'agenda' | 'todos'> => {
   const view = ctx.state.view!;
   return { me: ctx.record.email, role: view.role, lang: ctx.record.lang, timeZone: zoneOf(view, ctx.record), settings: view.settings, home: view.home?.address };
 };
-
-/**
- * The lists cut into parts for the export, each at most `size` items (an app record's items stay
- * together: a series is one event), without what the person doesn't see, as even as that allows.
- * Exporting each part and sorting the events together gives exactly `exportEvents` of the whole.
- */
-export function partition(loaded: Pick<Loaded, 'agenda' | 'todos'>, input: Pick<ExportInput, 'me' | 'role' | 'settings'>, size = UNIT_ITEMS): { agenda: AgendaItem[]; todos: TodoItem[] }[] {
-  const groups = new Map<string, AgendaItem[]>();
-  for (const item of loaded.agenda) {
-    if (!visibleTo(item, input)) continue;
-    const k = `${item.app}|${item.ref}`;
-    const g = groups.get(k);
-    if (g) g.push(item);
-    else groups.set(k, [item]);
-  }
-  const todos = input.settings.todos
-    ? (loaded.todos ?? []).filter((t) => t.status === 'open' && t.due !== undefined && !groups.has(`${t.app}|${t.ref}`) && visibleTo({ app: t.app, kind: 'task', private: t.private, audience: t.audience }, input))
-    : [];
-  const total = [...groups.values()].reduce((n, g) => n + g.length, 0) + todos.length;
-  // As even as the size allows: 63 items go as 32 and 31, not 50 and 13.
-  const even = Math.ceil(total / Math.max(1, Math.ceil(total / size)));
-  const parts: { agenda: AgendaItem[]; todos: TodoItem[] }[] = [];
-  let current = { agenda: [] as AgendaItem[], todos: [] as TodoItem[] };
-  const add = (n: number) => {
-    const has = current.agenda.length + current.todos.length;
-    if (has > 0 && has + n > even) {
-      parts.push(current);
-      current = { agenda: [], todos: [] };
-    }
-  };
-  for (const items of groups.values()) {
-    add(items.length);
-    current.agenda.push(...items);
-  }
-  for (const t of todos) {
-    add(1);
-    current.todos.push(t);
-  }
-  if (current.agenda.length + current.todos.length) parts.push(current);
-  return parts;
-}
 
 // ---- split: the signal, Google's changes carried back, the parts ----
 
@@ -660,56 +604,6 @@ const writtenOf = (r: EventRow): Written | undefined => {
 };
 
 // ---- export: one part's events ----
-
-/** One event's VEVENTs (the event, and a series' moved occurrences) as the feed writes them. */
-export function eventIcs(e: ExportEvent, { householdId, timeZone, lang, now }: { householdId: string; timeZone: string; lang: ExportInput['lang']; now: number }): string {
-  return toIcsEvents([e], { householdId, timeZone, lang }).flatMap((ie) => veventLines(ie, { timeZone, now })).map(foldLine).join(CRLF) + CRLF;
-}
-
-const bare = (e: ExportEvent): ExportEvent => {
-  const { todo: _t, ...rest } = e;
-  return { ...rest, items: [], ...(e.series ? { series: { ...e.series, overrides: e.series.overrides.map((o) => ({ ...o, items: [] })) } } : {}) };
-};
-
-/** The earliest year any of the event's VEVENTs touches, and whether any has a time. */
-function yearOf(e: ExportEvent, householdId: string, timeZone: string, lang: ExportInput['lang']): { year: number; timed: boolean } {
-  let year = Infinity;
-  let timed = false;
-  for (const ie of toIcsEvents([e], { householdId, timeZone, lang })) {
-    const t = 'date' in ie.start ? Date.parse(`${ie.start.date}T00:00:00Z`) : ie.start.at;
-    year = Math.min(year, new Date(t).getUTCFullYear());
-    if (!('date' in ie.start)) timed = true;
-  }
-  return { year, timed };
-}
-
-/** Keeps, of `witness` and `events`, the ones that decide the header: the earliest year, and one with a time. */
-export function keepWitness(witness: ExportEvent[], events: readonly ExportEvent[], householdId: string, timeZone: string, lang: ExportInput['lang']): ExportEvent[] {
-  let earliest: { e: ExportEvent; year: number } | null = null;
-  let timed: ExportEvent | null = null;
-  for (const e of [...witness, ...events]) {
-    const y = yearOf(e, householdId, timeZone, lang);
-    if (!earliest || y.year < earliest.year) earliest = { e, year: y.year };
-    if (!timed && y.timed) timed = e;
-  }
-  return [...new Set([earliest?.e, timed].filter((e): e is ExportEvent => !!e))].map(bare);
-}
-
-/**
- * The header `exportIcs` writes for the calendar (the time zone when any event has a time, from
- * the earliest year any event touches), cut from the calendar of the events that decide it.
- */
-export function icsHeader(witness: readonly ExportEvent[], options: Parameters<typeof exportIcs>[1]): string {
-  const text = exportIcs(witness, options);
-  const at = text.indexOf(`BEGIN:VEVENT${CRLF}`);
-  return text.slice(0, at >= 0 ? at : text.lastIndexOf(`END:VCALENDAR${CRLF}`));
-}
-
-/** The calendar from its events' text (any order) and the header's events: `exportIcs` of them all. */
-export function assembleIcs(pieces: readonly Piece[], witness: readonly ExportEvent[], options: Parameters<typeof exportIcs>[1]): string {
-  const sorted = [...pieces].sort((a, b) => a.s - b.s || a.k.localeCompare(b.k));
-  return icsHeader(witness, options) + sorted.map((p) => p.t).join('') + `END:VCALENDAR${CRLF}`;
-}
 
 async function exportStep(ctx: Ctx): Promise<Next> {
   const { state, record, env, pid } = ctx;
@@ -849,14 +743,6 @@ async function deletesStep(ctx: Ctx): Promise<Next> {
   return state.spilled ? 'yield' : 'continue';
 }
 
-const parseOverrides = (s: string | null): { original: string; etag: string | null }[] => {
-  try {
-    return s ? (JSON.parse(s) as { original: string; etag: string | null }[]) : [];
-  } catch {
-    return [];
-  }
-};
-
 async function writeStep(ctx: Ctx): Promise<Next> {
   const { state, record, env, pid, now } = ctx;
   const google = record.google!;
@@ -865,9 +751,14 @@ async function writeStep(ctx: Ctx): Promise<Next> {
   let group: WriteItem[];
   const fromRow = state.writes.length > 0;
   if (fromRow) group = unitsOf(state.writes)[0];
-  else if (state.delAt < state.segs.del) group = (await opened<WriteItem[]>(ctx, (await handedOn(ctx, 'del'))[state.delAt++])) ?? [];
-  else if (state.writeAt < state.segs.write) group = (await opened<WriteItem[]>(ctx, (await handedOn(ctx, 'write'))[state.writeAt++])) ?? [];
-  else return finishSync(ctx);
+  else {
+    const part = state.delAt < state.segs.del ? 'del' : state.writeAt < state.segs.write ? 'write' : null;
+    if (!part) return finishSync(ctx);
+    const found = await opened<WriteItem[]>(ctx, (await handedOn(ctx, part))[part === 'del' ? state.delAt++ : state.writeAt++]);
+    // A group gone missing: its writes weren't made, so the round can't say the calendar matches.
+    if (!found) state.counts.failed++;
+    group = found ?? [];
+  }
   const picked = group.map((item, i) => ({ seq: i, item }));
   const requests = picked.flatMap((p) => p.item.requests);
   let responses: { status: number; body: unknown }[] = [];

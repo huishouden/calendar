@@ -7,8 +7,9 @@ ALTER TABLE people ADD COLUMN round TEXT;
 ALTER TABLE people ADD COLUMN round_kind INTEGER;
 -- When the round started: one older than ROUND_MAX_MS starts again.
 ALTER TABLE people ADD COLUMN round_at INTEGER;
--- The lists' counts and sums of `updatedAt` the check that marked the work asked (JSON, no
--- content): the round's first unit reads the lists by them instead of asking again.
+-- The household's shared lists' counts and sums of `updatedAt` as the check that marked an admin's or
+-- member's work asked them, sealed for `counts:<pid>` (src/check.ts): the round reads those lists by
+-- them instead of asking again.
 ALTER TABLE people ADD COLUMN hh_counts TEXT;
 
 -- What a round hands from one unit to the next when it is too big for the row, sealed for

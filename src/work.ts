@@ -2,8 +2,9 @@ import type { Env, Fetch } from './env';
 import { log } from './log';
 import { CalendarApiError, isRateLimited } from './google/api';
 import { GoogleAuthError } from './google/oauth';
-import { openPerson, upsertPersonRow, type PersonRow } from './store';
-import { runUnit, zeroCounts, type RoundKind } from './round';
+import { clearRoundItems, openPerson, roundStatement, upsertPersonRow, type PersonRow } from './store';
+import { FEED, runUnit, SYNC, type RoundKind } from './round';
+import { zeroCounts, type SyncCounts } from './sync';
 
 export { dropFeed } from './store';
 
@@ -21,8 +22,7 @@ export { dropFeed } from './store';
  * - A unit that leaves work (the rest of its round, or the other kind) hands it to the next unit.
  */
 
-export const FEED = 1 as const;
-export const SYNC = 2 as const;
+export { FEED, SYNC };
 
 /** How long a unit may hold the person; a unit that died lets go when it runs out. */
 export const LEASE_MS = 2 * 60_000;
@@ -134,7 +134,7 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
   const kind: RoundKind | 0 = going || (held.work & SYNC ? SYNC : held.work & FEED ? FEED : 0);
   if (!kind) {
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(pid),
+      clearRoundItems(env, pid),
       env.DB.prepare('UPDATE people SET lease_until = NULL, queued_at = NULL, round = NULL, round_kind = NULL, round_at = NULL WHERE pid = ?').bind(pid),
     ]);
     return { done: true };
@@ -151,7 +151,7 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
             done: true,
             step: 'none',
             limited: false,
-            statements: [...(kind === SYNC ? [env.DB.prepare('UPDATE people SET google = 0 WHERE pid = ?').bind(pid)] : []), env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(pid)],
+            statements: [...(kind === SYNC ? [env.DB.prepare('UPDATE people SET google = 0 WHERE pid = ?').bind(pid)] : []), clearRoundItems(env, pid)],
             round: null,
             started: now,
             finished: kind,
@@ -160,7 +160,7 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
           };
   } catch (e) {
     // The round as the unit before left it: on the row, for whichever unit comes next.
-    const keep = given ? [env.DB.prepare('UPDATE people SET round = ?, round_kind = ?, round_at = ? WHERE pid = ?').bind(given.round, given.kind, now, pid)] : [];
+    const keep = given?.round ? [roundStatement(env, pid, { sealed: given.round, kind: given.kind, at: now })] : [];
     if (isRateLimited(e)) return backOff(env, pid, held, now, name, keep);
     const reason = e instanceof CalendarApiError ? `google-${e.status}` : e instanceof GoogleAuthError ? `google-${e.kind}` : 'error';
     // A feed that couldn't be built keeps serving the last one; a sync's error shows in the portal.
@@ -174,7 +174,7 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
     return { retryAfter: 60, reason: 'error' };
   }
   const round = { round: unit.round, kind: unit.round ? kind : null, at: unit.round ? unit.started : null };
-  if (unit.limited) return backOff(env, pid, held, now, name, [...unit.statements, env.DB.prepare('UPDATE people SET round = ?, round_kind = ?, round_at = ? WHERE pid = ?').bind(round.round, round.kind, round.at, pid)]);
+  if (unit.limited) return backOff(env, pid, held, now, name, [...unit.statements, roundStatement(env, pid, unit.round ? { sealed: unit.round, kind, at: unit.started } : null)]);
   const depth = (handed?.depth ?? 0) + 1;
   const chain = !!deps.next && depth < MAX_CHAIN;
   if (!unit.done && chain) {
@@ -240,6 +240,14 @@ export async function buildFeed(env: Env, pid: string, deps: Omit<WorkDeps, 'nex
   await runRound(env, pid, FEED, deps);
 }
 
+/**
+ * One person's whole sync round, every unit in this invocation: for tests and the command line; the
+ * Worker runs one unit per invocation (`runWork`).
+ */
+export async function syncPerson(env: Env, pid: string, deps: Omit<WorkDeps, 'next' | 'handover'> = {}): Promise<SyncCounts> {
+  return (await runRound(env, pid, SYNC, deps))?.counts ?? zeroCounts();
+}
+
 /** Every unit of a round of `kind` for the person, in this invocation, without the lease. */
 export async function runRound(env: Env, pid: string, kind: RoundKind, deps: Omit<WorkDeps, 'next' | 'handover'> = {}) {
   const now = deps.now ?? Date.now();
@@ -253,7 +261,8 @@ export async function runRound(env: Env, pid: string, kind: RoundKind, deps: Omi
     const unit = await runUnit(env, pid, kind, row, record, deps);
     await env.DB.batch([
       ...unit.statements,
-      env.DB.prepare('UPDATE people SET work = work & ~?1, round = ?2, round_kind = ?3, round_at = ?4 WHERE pid = ?5').bind(unit.finished, unit.round, unit.round ? kind : null, unit.round ? unit.started : null, pid),
+      env.DB.prepare('UPDATE people SET work = work & ~? WHERE pid = ?').bind(unit.finished, pid),
+      roundStatement(env, pid, unit.round ? { sealed: unit.round, kind, at: unit.started } : null),
     ]);
     if (unit.done || unit.limited) return unit;
   }

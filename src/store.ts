@@ -66,7 +66,33 @@ export async function loadPerson(env: Env, pid: string): Promise<PersonRecord | 
 }
 
 export async function savePerson(env: Env, pid: string, record: PersonRecord): Promise<void> {
-  await upsertPersonRow(env, pid, { record: await seal(env.SEAL_KEY, personKey(pid), record), hh: await householdKey(record.household) }, Date.now());
+  await (await savePersonStatement(env, pid, record)).run();
+}
+
+/** `savePerson` as a statement, for a batch. */
+export async function savePersonStatement(env: Env, pid: string, record: PersonRecord): Promise<D1PreparedStatement> {
+  return personRowStatement(env, pid, { record: await seal(env.SEAL_KEY, personKey(pid), record), hh: await householdKey(record.household) }, Date.now());
+}
+
+// ---- A round under way (src/round.ts) ----
+
+/** The round on the person's row (sealed), its kind and when it started; null clears it. */
+export function roundStatement(env: Env, pid: string, round: { sealed: string; kind: number; at: number } | null): D1PreparedStatement {
+  return env.DB.prepare('UPDATE people SET round = ?, round_kind = ?, round_at = ? WHERE pid = ?').bind(round?.sealed ?? null, round?.kind ?? null, round?.at ?? null, pid);
+}
+
+/** What the person's round handed from unit to unit (`round_items`): gone. */
+export function clearRoundItems(env: Env, pid: string): D1PreparedStatement {
+  return env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(pid);
+}
+
+/** Rounds left unfinished for a day (their person's work went another way), once an hour. */
+export async function forgetRounds(env: Env, now: number): Promise<void> {
+  const day = now - 24 * 3_600_000;
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM round_items WHERE pid IN (SELECT pid FROM people WHERE round_at < ?)').bind(day),
+    env.DB.prepare('UPDATE people SET round = NULL, round_kind = NULL, round_at = NULL WHERE round_at < ?').bind(day),
+  ]);
 }
 
 export async function deletePerson(env: Env, pid: string): Promise<void> {
@@ -165,7 +191,7 @@ export async function deletePersonRows(env: Env, pid: string, { events = true, f
   if (events) statements.push(env.DB.prepare('DELETE FROM events WHERE pid = ?').bind(pid));
   if (feed) statements.push(env.DB.prepare('DELETE FROM feeds WHERE pid = ?').bind(pid));
   if (person) {
-    statements.push(env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(pid));
+    statements.push(clearRoundItems(env, pid));
     statements.push(env.DB.prepare('DELETE FROM people WHERE pid = ?').bind(pid));
   }
   if (statements.length) await env.DB.batch(statements);

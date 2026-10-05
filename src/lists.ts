@@ -67,33 +67,11 @@ export const listKey = (household: string, collection: string, query: string): P
 
 /** The list's documents, from the kept copy where it is still right (see above). */
 export async function readList(env: Env, key: string, reads: ListReads, now: number): Promise<{ docs: Doc[]; outcome: ListOutcome }> {
-  const fresh = await reads.tally();
+  const tally = await reads.tally();
+  const read = (await readLists(env, [{ key, tally, reads }], now))!;
   // The copy is best-effort: D1 failing (its daily writes used up) costs reads, never the load.
-  const row = await env.DB.prepare('SELECT body, at FROM lists WHERE key = ?')
-    .bind(key)
-    .first<{ body: string; at: number }>()
-    .catch(dbFailed);
-  const kept = row && now - row.at < LIST_MAX_AGE_MS && row.at <= now ? await unseal<Kept>(env.SEAL_KEY, `list:${key}`, row.body) : null;
-  if (kept && row) {
-    if (same(tallyOf(kept.docs), fresh)) {
-      await touch(env, key, now);
-      return { docs: kept.docs, outcome: 'kept' };
-    }
-    if (reads.since) {
-      const changed = await reads.since(newest(kept.docs));
-      const merged = new Map(kept.docs.map((d) => [d.path, d]));
-      for (const d of changed) merged.set(d.path, d);
-      const docs = [...merged.values()];
-      if (same(tallyOf(docs), fresh)) {
-        // Keeps the copy's age: a day after it was read whole, it is read whole again.
-        await store(env, key, docs, row.at, now);
-        return { docs, outcome: 'delta' };
-      }
-    }
-  }
-  const docs = await reads.all();
-  await store(env, key, docs, now, now);
-  return { docs, outcome: 'full' };
+  if (read.statements.length) await env.DB.batch(read.statements).catch(dbFailed);
+  return { docs: read.docs[0], outcome: read.outcomes[0] };
 }
 
 const dbFailed = (e: unknown): null => {
@@ -101,38 +79,9 @@ const dbFailed = (e: unknown): null => {
   return null;
 };
 
-async function store(env: Env, key: string, docs: Doc[], at: number, now: number): Promise<void> {
-  await write(env, key, docs, at, now).catch(dbFailed);
-}
-
-async function write(env: Env, key: string, docs: Doc[], at: number, now: number): Promise<void> {
-  const body = await seal(env.SEAL_KEY, `list:${key}`, { docs } satisfies Kept);
-  if (body.length > MAX_SEALED) {
-    await env.DB.prepare('DELETE FROM lists WHERE key = ?').bind(key).run();
-    log('lists', { kept: false, reason: 'too-big' });
-    return;
-  }
-  await env.DB.prepare('INSERT INTO lists (key, body, at, used_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(key) DO UPDATE SET body = excluded.body, at = excluded.at, used_at = excluded.used_at')
-    .bind(key, body, at, now)
-    .run();
-}
-
-/** Marks a copy used, at most once an hour (rows written are a free-plan limit too). */
-async function touch(env: Env, key: string, now: number): Promise<void> {
-  await env.DB.prepare('UPDATE lists SET used_at = ?1 WHERE key = ?2 AND used_at < ?3').bind(now, key, now - 3_600_000).run().catch(dbFailed);
-}
-
-/**
- * Deletes copies nobody has used for `LIST_FORGET_MS` (a member who left, a household gone), and
- * rounds (src/round.ts) left unfinished for a day: their person's work went another way.
- */
+/** Deletes copies nobody has used for `LIST_FORGET_MS` (a member who left, a household gone). */
 export async function forgetLists(env: Env, now: number): Promise<void> {
-  const day = now - 24 * 3_600_000;
-  await env.DB.batch([
-    env.DB.prepare('DELETE FROM lists WHERE used_at < ?').bind(now - LIST_FORGET_MS),
-    env.DB.prepare('DELETE FROM round_items WHERE pid IN (SELECT pid FROM people WHERE round_at < ?)').bind(day),
-    env.DB.prepare('UPDATE people SET round = NULL, round_kind = NULL, round_at = NULL WHERE round_at < ?').bind(day),
-  ]);
+  await env.DB.prepare('DELETE FROM lists WHERE used_at < ?').bind(now - LIST_FORGET_MS).run();
 }
 
 /** A list to read in a round's unit (src/round.ts): its key, its aggregation already asked, how to read it. */
@@ -143,9 +92,11 @@ export interface ListPlan {
 }
 
 /**
- * Lists whose aggregations an earlier unit asked: every kept copy in one D1 read, then from
- * Firestore only what changed, as `readList` decides. The copies to store come back as statements
- * for the unit's batch. `keptOnly`: null as soon as a copy doesn't match, nothing asked of Firestore.
+ * Lists whose aggregations were asked: every kept copy in one D1 read, then from Firestore only
+ * what changed (the kept copy, what changed merged in, or the whole list: see above). The copies to
+ * store (and the hourly `used_at`) come back as statements: `readList` runs them best-effort; a
+ * round's unit (src/round.ts) runs them in its batch, so D1 refusing them fails the unit, which
+ * runs again. `keptOnly`: null as soon as a copy doesn't match, nothing asked of Firestore.
  */
 export async function readLists(env: Env, plans: ListPlan[], now: number, { keptOnly = false } = {}): Promise<{ docs: Doc[][]; outcomes: ListOutcome[]; statements: D1PreparedStatement[] } | null> {
   const statements: D1PreparedStatement[] = [];

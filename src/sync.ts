@@ -47,23 +47,14 @@ export interface SyncCounts {
   more: boolean;
 }
 
-const zero = (): SyncCounts => ({ changes: 0, echoes: 0, applied: 0, refused: 0, conflicts: 0, hidden: 0, inserted: 0, updated: 0, deleted: 0, failed: 0, limited: 0, requests: 0, full: false, more: false });
-
-export interface SyncDeps {
-  fetch?: Fetch;
-  /** The person's row, already read (src/work.ts). */
-  row?: PersonRow;
-  now?: number;
-  /** Firestore's REST base (tests: the emulator). */
-  firestoreUrl?: string;
-}
+export const zeroCounts = (): SyncCounts => ({ changes: 0, echoes: 0, applied: 0, refused: 0, conflicts: 0, hidden: 0, inserted: 0, updated: 0, deleted: 0, failed: 0, limited: 0, requests: 0, full: false, more: false });
 
 interface Override {
   original: string;
   etag: string | null;
 }
 
-const parseOverrides = (s: string | null): Override[] => {
+export const parseOverrides = (s: string | null): Override[] => {
   try {
     return s ? (JSON.parse(s) as Override[]) : [];
   } catch {
@@ -76,17 +67,6 @@ export function isEcho(g: GoogleEvent, row: EventRow | undefined): boolean {
   if (!row || !g.etag) return false;
   if (row.etag === g.etag) return true;
   return parseOverrides(row.overrides).some((o) => o.etag === g.etag);
-}
-
-/**
- * One person's whole sync round, every unit in this invocation (src/round.ts): for tests and the
- * command line; the Worker runs one unit per invocation (src/work.ts). Throws only for what the
- * caller should record as the run's error.
- */
-export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Promise<SyncCounts> {
-  const { runRound } = await import('./work');
-  const unit = await runRound(env, pid, 2, deps);
-  return unit?.counts ?? zero();
 }
 
 export interface PlannedRequest {
