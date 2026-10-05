@@ -572,9 +572,10 @@ bun run deploy              # production
 bunx wrangler tail          # one line per request, check run, unit of work (its steps and subrequests) and tick, with each invocation's cpuTime
 ```
 
-CI deploys staging, then production, on every push to `main` once the organisation secrets
-`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` reach this repo; until then the deploy job is
-skipped with a notice. The Worker's URL is `https://huishouden-calendar.<account>.workers.dev`
+CI deploys staging, then production, on every push to `main` once `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` are secrets of this repo's `production` environment (deployment branches:
+`main` alone, so no other branch's run can read them; `hh ops secret set calendar <name> --env
+production`, the value on stdin); until then the deploy job is skipped with a notice. The Worker's URL is `https://huishouden-calendar.<account>.workers.dev`
 (`-staging` for staging). It takes its own origin from each request, so feed links follow the
 account's workers.dev subdomain.
 

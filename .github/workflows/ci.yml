@@ -60,6 +60,9 @@ jobs:
     needs: [leak-scan, build]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # The Cloudflare token is a secret of the `production` environment, whose deployment branches
+    # are main alone: no other branch's run can read it.
+    environment: production
     steps:
       - name: Cloudflare token present?
         id: token
