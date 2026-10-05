@@ -182,10 +182,6 @@ export interface FeedRow {
   stale: number;
 }
 
-export async function feedRowOf(env: Env, pid: string): Promise<Pick<FeedRow, 'id' | 'signal' | 'stale'> | null> {
-  return env.DB.prepare('SELECT id, signal, stale FROM feeds WHERE pid = ? ORDER BY built_at DESC LIMIT 1').bind(pid).first();
-}
-
 /** The feed for `secret`, sealed so only the URL's secret opens it; any other feed of the person goes. */
 export async function putFeed(env: Env, pid: string, secret: string, { signal, etag, body, now }: { signal: string; etag: string; body: string; now: number }): Promise<void> {
   const id = await feedId(secret);
