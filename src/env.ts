@@ -30,6 +30,8 @@ export interface Env {
    * rather than go over it. Unset: no limit (a project on the Blaze plan).
    */
   FIRESTORE_CHECK_READS?: string;
+  /** Extra roots for the minute's checks (src/ticker.ts): each Ticker's alarm is its own top-level invocation. */
+  TICKER?: DurableObjectNamespace<TickerRpc>;
   /** Firestore's REST base, for the emulator in tests and `wrangler dev`; production leaves it out. */
   FIRESTORE_URL?: string;
 }
@@ -50,4 +52,9 @@ export interface FanoutRpc {
   /** Spending's alert inboxes: a few checked (src/mail/check.ts), and one unit of an inbox's import (src/mail/work.ts). */
   mail(ids: string[]): Promise<import('./mail/check').MailTotals>;
   mailWork(id: string): Promise<import('./work').WorkOutcome>;
+}
+
+/** A Ticker Durable Object (src/ticker.ts): told its part, it checks that share of every minute from its alarm. */
+export interface TickerRpc extends Rpc.DurableObjectBranded {
+  arm(part: number): Promise<void>;
 }

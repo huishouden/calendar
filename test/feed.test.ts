@@ -2,6 +2,7 @@ import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import ICAL from 'ical.js';
 import { icsProblems } from '@huishouden/pwa-kit/ics';
 import { handleApi } from '../src/api';
+import { personId } from '../src/store';
 import { serveFeed, FEED_PATH } from '../src/feed';
 import { captureLogs } from '../src/log';
 import { apiRequest, drain, household, refreshFor, readDoc, refresh, resetFirestore, seed, world, writeDoc, type World } from './helpers/world';
@@ -248,6 +249,21 @@ describe('the feed', () => {
     expect((await get(secret)).status).toBe(404);
   });
 
+  test('signed out everywhere (the refresh token is dead): the check marks it, not a Firestore error', async () => {
+    const secret = await setUpFeed('bob@example.com');
+    const pid = await personId(household, 'bob@example.com');
+    const { loadPerson, savePerson } = await import('../src/store');
+    await savePerson(w.env, pid, { ...(await loadPerson(w.env, pid))!, refreshToken: 'rt:revoked-bob#refresh-token' });
+    const { forgetTokens } = await import('../src/person');
+    forgetTokens();
+    const { checkPeople } = await import('../src/check');
+    const totals = await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now });
+    expect(totals.errors).toBe(0);
+    expect((await loadPerson(w.env, pid))!.signedOut).toBe(true);
+    // The stored feed stands.
+    expect((await get(secret)).status).toBe(200);
+  });
+
   test('a made-up secret is a 404; the KV holds nothing readable', async () => {
     await setUpFeed('alice@example.com');
     expect((await get('x'.repeat(32))).status).toBe(404);
@@ -281,6 +297,32 @@ describe('the API', () => {
     const res2 = await handleApi(w.env, apiRequest(`/api/status?household=${household}`, 'alice@example.com'), undefined, { fetch: down, now: w.clock.now });
     expect(res2.status).toBe(503);
     expect((await res2.json()) as unknown).toEqual({ error: 'unavailable' });
+  });
+
+  test('the ID token: Firestore’s check is the one that counts (forged: 401); another project’s or expired claims: 401 without a call', async () => {
+    const forged = async (url: string, init?: RequestInit) =>
+      url.includes('/documents/households/') ? Response.json({ error: { code: 401, message: 'Request had invalid authentication credentials.', status: 'UNAUTHENTICATED' } }, { status: 401 }) : w.fetch(url, init);
+    expect((await handleApi(w.env, apiRequest(`/api/status?household=${household}`, 'alice@example.com'), undefined, { fetch: forged, now: w.clock.now })).status).toBe(401);
+    let calls = 0;
+    const counting = async (url: string, init?: RequestInit) => (calls++, w.fetch(url, init));
+    const b64 = (o: object) => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const now = Math.floor(Date.now() / 1000);
+    for (const claims of [
+      { aud: 'another-project', iss: 'https://securetoken.google.com/another-project', exp: now + 3600, email: 'alice@example.com', email_verified: true, user_id: 'u-alice' },
+      { aud: 'demo-huishouden-calendar', iss: 'https://securetoken.google.com/demo-huishouden-calendar', exp: now - 10, email: 'alice@example.com', email_verified: true, user_id: 'u-alice' },
+      { aud: 'demo-huishouden-calendar', iss: 'https://securetoken.google.com/demo-huishouden-calendar', exp: now + 3600, email: 'alice@example.com', email_verified: false, user_id: 'u-alice' },
+    ]) {
+      const req = new Request(`https://calendar.example/api/status?household=${household}`, { headers: { Origin: 'https://site.example', Authorization: `Bearer ${b64({ alg: 'none' })}.${b64(claims)}.` } });
+      expect((await handleApi(w.env, req, undefined, { fetch: counting, now: w.clock.now })).status).toBe(401);
+    }
+    expect(calls).toBe(0);
+  });
+
+  test('the same refresh token again (each Make or rotate sends it): no exchange with Firebase Auth', async () => {
+    await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: 'Europe/Amsterdam' });
+    const before = w.authCalls.filter((c) => c === 'token').length;
+    expect((await call('/api/feed/rotate', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com') })).status).toBe(200);
+    expect(w.authCalls.filter((c) => c === 'token').length).toBe(before);
   });
 
   test('a refresh token must be the caller’s own', async () => {
