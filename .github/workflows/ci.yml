@@ -54,12 +54,15 @@ jobs:
       - name: Bundle (wrangler dry run)
         run: bunx wrangler deploy --dry-run --outdir dist
 
-  # Deploys on main once the repo has a CLOUDFLARE_API_TOKEN secret (README, "Deploy"); skipped
+  # Deploys on main once the `production` environment has a CLOUDFLARE_API_TOKEN secret (README, "Deploy"); skipped
   # until then. Staging first, then production. Worker secrets stay in Cloudflare.
   deploy:
     needs: [leak-scan, build]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # The Cloudflare token is a secret of the `production` environment, whose deployment branches
+    # are main alone: no other branch's run can read it.
+    environment: production
     steps:
       - name: Cloudflare token present?
         id: token
