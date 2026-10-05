@@ -75,10 +75,21 @@ export interface Granted {
   account: string;
 }
 
-/** The code from the app's popup, exchanged for tokens. `postmessage` is the popup flow's redirect. `scope` must have been granted. */
-export async function exchangeCode(env: Env, code: string, fetchImpl: Fetch = globalFetch, now = Date.now(), scope: string = CALENDAR_SCOPE): Promise<Granted> {
+/**
+ * The `redirect_uri` a code is exchanged with: `postmessage` for the app's popup, or the page Google
+ * sent the person back to ("Continue in this tab", the kit's `googleAuthCodeRedirect`), which must be
+ * one of GOOGLE_REDIRECT_URIS exactly. Null for anything else.
+ */
+export function redirectUriFor(env: Pick<Env, 'GOOGLE_REDIRECT_URIS'>, asked: unknown): string | null {
+  if (asked === undefined || asked === null || asked === '') return 'postmessage';
+  if (typeof asked !== 'string') return null;
+  return (env.GOOGLE_REDIRECT_URIS ?? '').split(/\s+/).filter(Boolean).includes(asked) ? asked : null;
+}
+
+/** The code from the app, exchanged for tokens with `redirectUri` (`redirectUriFor`). `scope` must have been granted. */
+export async function exchangeCode(env: Env, code: string, fetchImpl: Fetch = globalFetch, now = Date.now(), scope: string = CALENDAR_SCOPE, redirectUri = 'postmessage'): Promise<Granted> {
   if (!env.GOOGLE_CLIENT_SECRET) throw new GoogleAuthError('config', 'Google Calendar sync is not set up on this server');
-  const answer = await tokenCall(fetchImpl, { code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, redirect_uri: 'postmessage', grant_type: 'authorization_code' });
+  const answer = await tokenCall(fetchImpl, { code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, redirect_uri: redirectUri, grant_type: 'authorization_code' });
   const granted = answer.scope ?? '';
   if (!granted.split(/\s+/).includes(scope)) throw new GoogleAuthError('denied', scope === CALENDAR_SCOPE ? 'Calendar access was not allowed' : 'Gmail access was not allowed');
   if (!answer.refresh_token) throw new GoogleAuthError('denied', 'Google gave no lasting access; connect again');

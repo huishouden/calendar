@@ -8,7 +8,7 @@ import { feedUrl } from './feed';
 import { log } from './log';
 import { authOptions, overQuota, roleOf } from './person';
 import { Calendar, CalendarApiError } from './google/api';
-import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, revokeGoogle } from './google/oauth';
+import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, redirectUriFor, revokeGoogle } from './google/oauth';
 import { deletePerson, deletePersonRows, loadPerson, moveFeed, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
 import { lastChecked } from './tick';
 import { FEED, markWork, SYNC } from './work';
@@ -221,10 +221,12 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
       }
       case 'POST /api/google/connect': {
         if (typeof b.code !== 'string' || b.code.length > 2048) throw new HttpError(400, 'code');
+        const redirectUri = redirectUriFor(env, b.redirectUri);
+        if (!redirectUri) throw new HttpError(400, 'redirect-uri');
         const record = await personFrom(env, who, b, fetchImpl);
         let granted;
         try {
-          granted = await exchangeCode(env, b.code, fetchImpl, now);
+          granted = await exchangeCode(env, b.code, fetchImpl, now, CALENDAR_SCOPE, redirectUri);
         } catch (e) {
           if (e instanceof GoogleAuthError) throw new HttpError(e.kind === 'config' ? 501 : e.kind === 'unavailable' ? 503 : 400, `google-${e.kind}`, e.message.slice(0, 80));
           throw e;
