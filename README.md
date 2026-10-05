@@ -48,9 +48,10 @@ location (`LOCATION` in the feed, `location` in Google).
 | `src/api.ts` | The portal's calls: status, set up / rotate / revoke the feed, connect / sync / disconnect Google |
 | `src/tick.ts` | The cron: who is due this minute, checked a few at a time in their own invocations |
 | `src/check.ts` | The cheap check for a few people: did anything they see change? Marks and queues the work |
-| `src/work.ts` | One unit of a person's work per invocation: build their feed, or one round of their sync. Lease, back-off |
+| `src/work.ts` | One unit of a person's work per invocation, the next one handed the lease and the round straight after. Lease, back-off |
+| `src/round.ts` | A feed build or a sync round in units of at most 6 subrequests and 60 items: its steps, and what one unit hands the next |
 | `src/person.ts` | Acting as the person: their ID token on every Firestore call, their role and settings, the change signal |
-| `src/sync.ts` | One round of a person's Google sync: Google's changes, the household's, the writes in a batch |
+| `src/sync.ts` | What a person's Google sync writes: echoes of our own writes, the writes and rows for each event |
 | `src/warm.ts` | Run at startup: a small export, so a build in a fresh isolate doesn't pay for first use |
 | `src/backsync.ts` | A change made in Google read as an edit and applied to the record as the person |
 | `src/google/*` | OAuth (code exchange, refresh, revoke), the Calendar API with batching, event bodies and ids |
@@ -148,8 +149,8 @@ a round of the sync runs for the person:
    **Conflicts: last writer wins.** If the agenda item was updated after Google's change (its
    `updatedAt` against the event's `updated`), the app's version stands and is written to Google
    again.
-4. **The difference goes to Google**, up to 50 writes in a batch request per round. More than that
-   (a first sync) goes in the next round, at once:
+4. **The difference goes to Google**, up to 10 writes in a batch request per unit (`MAX_WRITES`),
+   deletions first. More than that (a first sync) goes in the units after, at once:
    - new events are inserted with ids made from the person and the key, so a retry can't make
      two;
    - changed events are rewritten (whole, recurrence included);
@@ -211,9 +212,25 @@ The limits that shape it:
      a sync due anyway (6 hours since the last full one, a stale feed) is still marked.
 3. **The work** (`src/work.ts`): a check that finds a change marks it in D1 and sends **one queue
    message for the person** (never a second while one is on its way). The consumer takes one
-   message per invocation (`max_batch_size = 1`). It does **one unit**: one round of the sync (up to
-   50 writes), or building the feed. The next unit, the other kind or more writes, is its own
-   invocation (`env.SELF.work`), straight away.
+   message per invocation (`max_batch_size = 1`). It does **one unit** of a round (`src/round.ts`):
+   a sync round or a feed build, in units of at most 6 subrequests (`UNIT_CALLS`) and 60 items
+   (`UNIT_ITEMS`), each within the free plan's 10 ms of CPU:
+   - `google` (sync): a page of Google's changes. `view`: the household and the person's settings,
+     and the lists' aggregations. For an admin or member, the shared lists' aggregations are the
+     ones the check that found the change asked, when that was in the last 10 minutes (sealed on the
+     person's row, `hh_counts`); a helper's or kid's lists and the personal lists are counted again,
+     as the person. `lists`: every kept copy in one D1 read, and
+     what changed. `split`: the signal (a sync with nothing to do ends here), Google's changes
+     carried back, the lists cut into parts. `export`, a part a unit: its events as feed text and as
+     Google writes. `feed`: the text put together, byte for byte what `exportIcs` writes of the
+     whole. `deletes`, then `write`, 10 writes a unit.
+   - A sync round for someone whose feed is due too builds the feed from the same export.
+   - The next unit is its own invocation (`env.SELF.work`), straight away, handed the lease and the
+     round (sealed): nothing is written to the person's row between units. What is too big to hand
+     over (the parts, the feed's text, many writes) goes to `round_items`, a row per kind, each value
+     appended once, so a unit run again can't add it twice. After 16 units (`MAX_CHAIN`, half of the
+     32 invocations a request may make) the round is put on the person's row and the queue takes
+     the next unit. A round not finished in 30 minutes starts again.
    - **Per-person order**: a unit holds the person's lease in D1. A second unit for them waits
      (the message comes back in 30 seconds), and the checks skip them meanwhile. Units work from what
      Firestore and Google say at the time, so their order can't undo anything.
@@ -259,7 +276,7 @@ once).
 | Durable Object duration | 4,320 alarms × ~2 s (waiting on their checks) × 128 MB | ~1,100 GB-s | 13,000 GB-s |
 | Subrequests per check invocation | 2 people × ~5 (change list, `batchGet`, 2 aggregations, a token now and then) + the household's shared 2 | ~12 | 50 |
 | Queue operations | 3,000 messages × 3 | **9,000** | 10,000 (more runs from the cron) |
-| D1 rows written | per change ~15 (mark, lease, person, ~2 events, release, feed; indexes included) × 3,000 = 45,000 + the signal seen changing 3,000 + kept lists ~2 per change 6,000 + token after echoes 3,000 + ticks 1,440 + stale feeds 5,000 | **~64,000** | 100,000 |
+| D1 rows written | per change ~22 (mark, lease, ~4 rows handed from unit to unit (written once, appended to, deleted), the kept list, ~2 events, the feed, the round's end; indexes included) × 3,000 = 66,000 + the signal seen changing 3,000 + token after echoes 3,000 + ticks 1,440 + stale feeds 5,000 | **~78,000** | 100,000 |
 | D1 rows read | roots 200 a minute × 1,440 = 288,000 (× 4 roots: each reads the minute's list) ~1.2 million + checks 288,000 + events read on echoes ~150,000 + syncs ~160,000 + fetches 24,000 | ~1.8 million | 5 million |
 | D1 storage | feeds ~40 KB sealed + ~50 events × ~1 KB, per person; kept lists ~100 KB per household | ~150 MB | 5 GB |
 | KV | reads: none on the request path (only a feed with nothing stored); writes: one per feed set up or rotated | ~0 / ~10 | 100,000 / 1,000 |
@@ -408,14 +425,13 @@ limit is the binding one: 100 accounts while the app is unverified.
   `firestore-quota` (the portal says so, rather than "couldn't reach"), feeds serve what is stored,
   and the checks pause.
 - **CPU**: the free plan allows 10 ms per invocation. A feed request serves what is stored, at
-  1 to 2 ms. A check is 2 people. A feed build or a sync round is one person in its own invocation,
-  and the cold start (language catalogues, the runtime's time zone data) happens once per isolate at
-  startup (`src/warm.ts`), which Cloudflare limits separately. Builds and some portal calls still
-  measure 8 to 18 ms (below), because a build needs about 6 Firestore requests (the household and
-  settings, four aggregations, and a query for each list that changed) and 2 to 3 D1 calls at about
-  1 ms each. Cloudflare answered every one of them `ok`: the free plan doesn't refuse an invocation the
-  moment it passes 10 ms. Workers Paid ($5 a month) raises the limit to 30 seconds and removes the
-  question.
+  1 to 2 ms. A check is 2 people. A feed build or a sync round is a chain of units
+  (`src/round.ts`), each its own invocation with at most 6 subrequests (about 1 ms of CPU each) and
+  at most 60 items exported or 10 Google writes, and the cold start (language catalogues, the
+  runtime's time zone data) happens once per isolate at startup (`src/warm.ts`), which Cloudflare
+  limits separately. Each unit logs its steps and subrequests (`"event":"work"`, `step`, `calls`).
+  Some portal calls still measure 8 to 16 ms (below). Workers Paid ($5 a month) raises the limit
+  to 30 seconds.
 - **Ahead of the window**: apps publish 180 days ahead (Home's regular events 60). A repeating event
   carries on past that by its schedule. A skip or move further ahead shows once it is within the
   app's window.
@@ -459,6 +475,19 @@ in a fresh isolate. The rest is subrequests, about 1 ms each, and first use of c
 isolate, which `src/warm.ts` moves to startup (38 ms of startup, of the 1 second allowed).
 Since #30 a round makes 4 Firestore requests fewer; the production sync figures above are from
 before it and #34.
+
+**Rounds in units** (`src/round.ts`), measured locally on an invented busy household (12 weekly
+series, 110 one-offs, 20 to-dos; 147 events): the process's CPU per unit under `bun test` against
+the Firestore emulator, the median of three runs, before and after. It counts the unit's own work
+(and the in-process D1), not the subrequests, which add about 1 ms each in workerd (at most 6 a
+unit, `calls` in the log).
+
+| Round | Before: units, CPU each (ms) | After: units, CPU each (ms) | D1 rows changed, before → after |
+|---|---|---|---|
+| First sync (151 Google events) | 3: 14, 24, 13 | 25: 0.3 to 6.1 | 155 → 177 |
+| Sync after one change | 1: 10 | 9: 0.5 to 5.3 | 4 → 11 |
+| Feed build after one change | 1: 15 | 8: 1.8 to 5.6 | 3 → 13 |
+| Both, after one change (one round) | 2: 12, 14 | 10: 0.9 to 4.7 | 7 → 17 |
 
 ## One-time setup
 
@@ -540,7 +569,7 @@ The portal calls this Worker at `VITE_CALENDAR_URL` (production) and `STAGING_VI
 ```sh
 bun run deploy:staging      # huishouden-calendar-staging, the huishouden-staging project
 bun run deploy              # production
-bunx wrangler tail          # one line per request, check run, unit of work and tick, with each invocation's cpuTime
+bunx wrangler tail          # one line per request, check run, unit of work (its steps and subrequests) and tick, with each invocation's cpuTime
 ```
 
 CI deploys staging, then production, on every push to `main` once the organisation secrets

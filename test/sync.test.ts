@@ -1,8 +1,8 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
-import { syncPerson, MAX_WRITES } from '../src/sync';
+import { MAX_WRITES } from '../src/sync';
 import { runCron, runPart, nextAlarm, pack, periodsFor, CHUNK, CAPACITY, slotsFor, GOOGLE_EVERY_MIN, FEED_EVERY_MIN, MAX_CALLS, READS_PER_CHECK, googleChecksPerDay } from '../src/tick';
-import { runWork, SYNC, FEED, markWork } from '../src/work';
+import { runWork, SYNC, FEED, markWork, MAX_CHAIN, syncPerson } from '../src/work';
 import { checkPeople } from '../src/check';
 import { personId, loadPerson } from '../src/store';
 import { eventId, instanceId } from '../src/google/events';
@@ -297,29 +297,39 @@ describe('fan-out and the queue', () => {
     expect(busy).toEqual({ retryAfter: 30, reason: 'busy' });
     const totals = await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now });
     expect(totals.skipped).toBe(1);
-    // Once the lease ends (or runs out), the waiting unit runs.
+    // Once the lease ends (or runs out), the waiting unit runs, and the round's next units after it.
     w.clock.now += 61_000;
-    expect('done' in (await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now }))).toBe(true);
+    expect('done' in (await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now, next: (p, h) => w.env.SELF!.work(p, h) }))).toBe(true);
+    await drain(w);
     expect((await w.env.DB.prepare('SELECT work, lease_until FROM people WHERE pid = ?').bind(pid).first<Record<string, unknown>>())).toEqual({ work: 0, lease_until: null });
   });
 
-  test('feed and sync for one person: two units, one after the other, each its own invocation', async () => {
+  test('feed and sync for one person: one round does both (one export), each unit its own invocation', async () => {
     await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
     const { pid } = await connect();
-    const units: string[] = [];
+    const units: number[] = [];
     const self = w.env.SELF!;
-    w.env.SELF = { ...self, work: async (p) => (units.push('next'), self.work(p)) };
+    w.env.SELF = { ...self, work: async (p, h) => (units.push(h?.depth ?? 0), self.work(p, h)) };
+    const logs = captureLogs();
     const path = `households/${household}/agenda/baby_appointment_a1`;
     await writeDoc(path, { ...(await readDoc(path))!, title: 'Checkup at 18 months', updatedAt: w.clock.now + MIN });
     const totals = await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now });
     expect(totals.marked).toBe(1);
     expect((await w.env.DB.prepare('SELECT work FROM people WHERE pid = ?').bind(pid).first<{ work: number }>())!.work).toBe(FEED | SYNC);
     expect(w.queue.length).toBe(1);
-    const first = await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now, next: (p) => w.env.SELF!.work(p) });
-    w.queue.length = 0;
+    const first = await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now, next: (p, h) => w.env.SELF!.work(p, h) });
+    await drain(w);
+    logs.restore();
     expect(first).toEqual({ done: true, kind: 'sync', more: true });
-    expect(units).toEqual(['next']);
+    // Each next unit through `SELF` (its own invocation), MAX_CHAIN at most before the queue takes over.
+    expect(units.length).toBeGreaterThan(1);
+    expect(Math.max(...units)).toBeLessThan(MAX_CHAIN);
+    const lines = logs.lines.map((l) => JSON.parse(l) as { event: string; kind?: string; built?: boolean });
+    // The sync round built the feed from the same export: no feed round of its own.
+    expect(new Set(lines.filter((l) => l.event === 'work').map((l) => l.kind))).toEqual(new Set(['sync']));
+    expect(lines.filter((l) => l.event === 'feed' && l.built).length).toBe(1);
     expect((await w.env.DB.prepare('SELECT work FROM people WHERE pid = ?').bind(pid).first<{ work: number }>())!.work).toBe(0);
+    expect(w.google.live((await loadPerson(w.env, pid))!.google!.calendarId).some((e) => e.summary === 'Checkup at 18 months')).toBe(true);
   });
 
   test('more than one unit of writes: the rest goes in the next unit straight away', async () => {
@@ -332,7 +342,7 @@ describe('fan-out and the queue', () => {
     await markWork(w.env, pid, SYNC, w.clock.now);
     let units = 0;
     const self = w.env.SELF!;
-    w.env.SELF = { ...self, work: async (p) => (units++, self.work(p)) };
+    w.env.SELF = { ...self, work: async (p, h) => (units++, self.work(p, h)) };
     await drain(w);
     expect(units).toBeGreaterThanOrEqual(1);
     expect(w.google.live(calendarId).filter((e) => e.summary?.startsWith('Job ')).length).toBe(MAX_WRITES + 5);
@@ -355,7 +365,8 @@ describe('fan-out and the queue', () => {
     expect(await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now })).toEqual({ retryAfter: 60, reason: 'backoff' });
     w.google.failNext = null;
     w.clock.now += 61_000;
-    expect(await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now })).toEqual({ done: true, kind: 'sync', more: false });
+    expect(await runWork(w.env, pid, { fetch: w.fetch, now: w.clock.now })).toEqual({ done: true, kind: 'sync', more: true });
+    await drain(w);
     expect((await w.env.DB.prepare('SELECT backoff, backoff_until FROM people WHERE pid = ?').bind(pid).first<Record<string, unknown>>())).toEqual({ backoff: 0, backoff_until: null });
   });
 
@@ -389,6 +400,12 @@ describe('fan-out and the queue', () => {
     expect((await w.env.DB.prepare('SELECT work, queued_at FROM people WHERE pid = ?').bind(pid).first<Record<string, unknown>>())).toEqual({ work: SYNC, queued_at: null });
     const totals = await runCron(w.env, { fetch: w.fetch, now: w.clock.now });
     expect(totals.worked).toBe(1);
+    // Each minute's cron runs MAX_CHAIN units of the round, until it is done.
+    for (let m = 1; m <= 3; m++) {
+      if ((await w.env.DB.prepare('SELECT work FROM people WHERE pid = ?').bind(pid).first<{ work: number }>())!.work === 0) break;
+      await runCron(w.env, { fetch: w.fetch, now: w.clock.now + m * MIN });
+    }
+    expect((await w.env.DB.prepare('SELECT work FROM people WHERE pid = ?').bind(pid).first<{ work: number }>())!.work).toBe(0);
     expect(w.google.cal(calendarId).events.get((await ids(pid)).checkup)!.summary).toBe('Checkup at 18 months');
   });
 

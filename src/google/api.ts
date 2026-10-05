@@ -135,17 +135,23 @@ export class Calendar {
     const items: GoogleEvent[] = [];
     let pageToken: string | undefined;
     for (let page = 0; page < maxPages; page++) {
-      const q = new URLSearchParams({ maxResults: '250', showDeleted: 'true' });
-      if (syncToken) q.set('syncToken', syncToken);
-      if (pageToken) q.set('pageToken', pageToken);
-      const { status, body } = await this.call<{ items?: GoogleEvent[]; nextPageToken?: string; nextSyncToken?: string }>('GET', `/calendars/${enc(calendarId)}/events?${q}`);
-      if (status === 410) throw new SyncTokenGone('Sync token expired');
-      if (status !== 200) throw Calendar.fail('list events', status, body);
-      items.push(...(body.items ?? []));
-      if (!body.nextPageToken) return { items, nextSyncToken: body.nextSyncToken, complete: true };
-      pageToken = body.nextPageToken;
+      const answer = await this.changesPage(calendarId, syncToken, pageToken);
+      items.push(...answer.items);
+      if (!answer.nextPageToken) return { items, nextSyncToken: answer.nextSyncToken, complete: true };
+      pageToken = answer.nextPageToken;
     }
     return { items, complete: false };
+  }
+
+  /** One page (250) of `changes`: the next page's token, or on the last page the next sync token. */
+  async changesPage(calendarId: string, syncToken: string | null, pageToken?: string): Promise<{ items: GoogleEvent[]; nextPageToken?: string; nextSyncToken?: string }> {
+    const q = new URLSearchParams({ maxResults: '250', showDeleted: 'true' });
+    if (syncToken) q.set('syncToken', syncToken);
+    if (pageToken) q.set('pageToken', pageToken);
+    const { status, body } = await this.call<{ items?: GoogleEvent[]; nextPageToken?: string; nextSyncToken?: string }>('GET', `/calendars/${enc(calendarId)}/events?${q}`);
+    if (status === 410) throw new SyncTokenGone('Sync token expired');
+    if (status !== 200) throw Calendar.fail('list events', status, body);
+    return { items: body.items ?? [], ...(body.nextPageToken ? { nextPageToken: body.nextPageToken } : {}), ...(body.nextSyncToken ? { nextSyncToken: body.nextSyncToken } : {}) };
   }
 
   /** Many writes, 50 to a request; answers in the same order. */

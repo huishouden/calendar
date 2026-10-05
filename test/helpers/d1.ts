@@ -25,6 +25,9 @@ class Statement {
   runSync() {
     this.db.query(this.sql).run(...(this.params as never[]));
   }
+  allSync(): unknown[] {
+    return this.db.query(this.sql).all(...(this.params as never[]));
+  }
 }
 
 export function memoryD1(): D1Database {
@@ -33,10 +36,8 @@ export function memoryD1(): D1Database {
   for (const f of readdirSync(dir).sort()) db.exec(readFileSync(join(dir, f), 'utf8'));
   return {
     prepare: (sql: string) => new Statement(db, sql),
-    batch: async (statements: Statement[]) => {
-      db.transaction(() => statements.forEach((s) => s.runSync()))();
-      return statements.map(() => ({ success: true }));
-    },
+    // As D1 does: in one transaction, each statement's rows (a SELECT's, or RETURNING's).
+    batch: async (statements: Statement[]) => db.transaction(() => statements.map((s) => ({ success: true, results: s.allSync() })))(),
   } as unknown as D1Database;
 }
 

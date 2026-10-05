@@ -5,9 +5,10 @@ import { log } from './log';
 import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
-import { eventRows, openPerson, savePerson, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
+import { eventRows, openPerson, savePerson, sealCounts, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
 import { FULL_EVERY_MS, isEcho } from './sync';
-import { dropFeed, FEED, markWork, SYNC } from './work';
+import { dropFeed, markWork } from './work';
+import { FEED, SYNC } from './round';
 
 /**
  * The cheap check, for a few people at a time (one fan-out invocation, src/tick.ts): has anything
@@ -182,9 +183,16 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
   }
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
   let signal: string;
+  let counts: string | null;
   try {
     const view = await person.view();
-    signal = await person.signal(view, signalExtra(view, record), shared);
+    const read = await person.signalAndCounts(view, signalExtra(view, record), shared);
+    signal = read.signal;
+    // What a round's first unit would ask again (src/round.ts `view`), kept with the signal, sealed:
+    // the household's shared lists as an admin or member counts them (all of them), never a
+    // helper's or kid's (what the rules let them see may change before the round) nor anyone's
+    // personal lists; the round asks those again as the person.
+    counts = view.restricted ? null : await sealCounts(env, row.pid, { at: now, todos: view.settings.todos, sharedAgenda: read.counts[0]!, sharedTodos: read.counts[2] });
   } catch (e) {
     if (e instanceof NotMember) {
       if (record.feed) await dropFeed(env, row.pid, now);
@@ -198,14 +206,16 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
     }
     throw e;
   }
+  const found = (google && signal !== row.signal ? SYNC : 0) | (record.feed && row.feed === 1 && (!row.feed_signal || row.feed_signal !== signal) ? FEED : 0);
   if (signal !== row.hh_signal) {
     // Seen changing (not the first time it is seen): the household counts as active for an hour.
-    await env.DB.prepare('UPDATE people SET hh_signal = ?, hh_signal_at = ? WHERE pid = ?').bind(signal, row.hh_signal ? now : 0, row.pid).run();
+    await env.DB.prepare('UPDATE people SET hh_signal = ?, hh_signal_at = ?, hh_counts = ? WHERE pid = ?').bind(signal, row.hh_signal ? now : 0, counts, row.pid).run();
+  } else if (found) {
+    await env.DB.prepare('UPDATE people SET hh_counts = ? WHERE pid = ?').bind(counts, row.pid).run();
   }
-  if (google && signal !== row.signal) kinds |= SYNC;
-  if (record.feed && row.feed === 1 && (!row.feed_signal || row.feed_signal !== signal)) kinds |= FEED;
-  return kinds;
+  return kinds | found;
 }
+
 
 /** The work due whatever the household did: a sync not fully rebuilt in FULL_EVERY_MS, a feed a request marked stale. */
 export function dueAnyway(row: Pick<CheckRow, 'full_at' | 'feed' | 'feed_stale'>, record: Pick<PersonRecord, 'feed'>, now: number, google: boolean): number {

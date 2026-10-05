@@ -1,6 +1,8 @@
 import type { Lang } from '@huishouden/pwa-kit/i18n';
 import { randomSecret, sha256 } from './b64';
 import type { Env } from './env';
+import { log } from './log';
+import type { Tally } from './lists';
 import { seal, unseal } from './seal';
 
 /**
@@ -65,7 +67,33 @@ export async function loadPerson(env: Env, pid: string): Promise<PersonRecord | 
 }
 
 export async function savePerson(env: Env, pid: string, record: PersonRecord): Promise<void> {
-  await upsertPersonRow(env, pid, { record: await seal(env.SEAL_KEY, personKey(pid), record), hh: await householdKey(record.household) }, Date.now());
+  await (await savePersonStatement(env, pid, record)).run();
+}
+
+/** `savePerson` as a statement, for a batch. */
+export async function savePersonStatement(env: Env, pid: string, record: PersonRecord): Promise<D1PreparedStatement> {
+  return personRowStatement(env, pid, { record: await seal(env.SEAL_KEY, personKey(pid), record), hh: await householdKey(record.household) }, Date.now());
+}
+
+// ---- A round under way (src/round.ts) ----
+
+/** The round on the person's row (sealed), its kind and when it started; null clears it. */
+export function roundStatement(env: Env, pid: string, round: { sealed: string; kind: number; at: number } | null): D1PreparedStatement {
+  return env.DB.prepare('UPDATE people SET round = ?, round_kind = ?, round_at = ? WHERE pid = ?').bind(round?.sealed ?? null, round?.kind ?? null, round?.at ?? null, pid);
+}
+
+/** What the person's round handed from unit to unit (`round_items`): gone. */
+export function clearRoundItems(env: Env, pid: string): D1PreparedStatement {
+  return env.DB.prepare('DELETE FROM round_items WHERE pid = ?').bind(pid);
+}
+
+/** Rounds left unfinished for a day (their person's work went another way), once an hour. */
+export async function forgetRounds(env: Env, now: number): Promise<void> {
+  const day = now - 24 * 3_600_000;
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM round_items WHERE pid IN (SELECT pid FROM people WHERE round_at < ?)').bind(day),
+    env.DB.prepare('UPDATE people SET round = NULL, round_kind = NULL, round_at = NULL WHERE round_at < ?').bind(day),
+  ]);
 }
 
 export async function deletePerson(env: Env, pid: string): Promise<void> {
@@ -122,6 +150,12 @@ export interface PersonRow {
   /** The household side's signal at the last check that read it, and when it last changed (0: never seen changing). */
   hh_signal: string | null;
   hh_signal_at: number | null;
+  /** The round under way (src/round.ts), sealed; its kind (FEED, SYNC) and when it started. */
+  round: string | null;
+  round_kind: number | null;
+  round_at: number | null;
+  /** The household's shared lists' counts the last check that marked work asked (`HouseholdCounts`), sealed for `counts:<pid>`. */
+  hh_counts: string | null;
 }
 
 export interface EventRow {
@@ -140,21 +174,27 @@ export async function personRow(env: Env, pid: string): Promise<PersonRow | null
 }
 
 export async function upsertPersonRow(env: Env, pid: string, fields: Partial<Omit<PersonRow, 'pid' | 'created_at' | 'shard'>>, now: number): Promise<void> {
+  await personRowStatement(env, pid, fields, now).run();
+}
+
+/** `upsertPersonRow` as a statement, for a batch. */
+export function personRowStatement(env: Env, pid: string, fields: Partial<Omit<PersonRow, 'pid' | 'created_at' | 'shard'>>, now: number): D1PreparedStatement {
   const cols = Object.keys(fields);
   const values = Object.values(fields);
   const insertCols = ['pid', 'created_at', 'shard', ...cols];
   const placeholders = insertCols.map(() => '?').join(', ');
   const updates = cols.map((c) => `${c} = excluded.${c}`).join(', ');
-  await env.DB.prepare(`INSERT INTO people (${insertCols.join(', ')}) VALUES (${placeholders}) ON CONFLICT(pid) DO ${updates ? `UPDATE SET ${updates}` : 'NOTHING'}`)
-    .bind(pid, now, shardOf(pid), ...values)
-    .run();
+  return env.DB.prepare(`INSERT INTO people (${insertCols.join(', ')}) VALUES (${placeholders}) ON CONFLICT(pid) DO ${updates ? `UPDATE SET ${updates}` : 'NOTHING'}`).bind(pid, now, shardOf(pid), ...values);
 }
 
 export async function deletePersonRows(env: Env, pid: string, { events = true, feed = true, person = true } = {}): Promise<void> {
   const statements = [];
   if (events) statements.push(env.DB.prepare('DELETE FROM events WHERE pid = ?').bind(pid));
   if (feed) statements.push(env.DB.prepare('DELETE FROM feeds WHERE pid = ?').bind(pid));
-  if (person) statements.push(env.DB.prepare('DELETE FROM people WHERE pid = ?').bind(pid));
+  if (person) {
+    statements.push(clearRoundItems(env, pid));
+    statements.push(env.DB.prepare('DELETE FROM people WHERE pid = ?').bind(pid));
+  }
   if (statements.length) await env.DB.batch(statements);
 }
 
@@ -186,13 +226,18 @@ export interface FeedRow {
 }
 
 /** The feed for `secret`, sealed so only the URL's secret opens it; any other feed of the person goes. */
-export async function putFeed(env: Env, pid: string, secret: string, { signal, etag, body, now }: { signal: string; etag: string; body: string; now: number }): Promise<void> {
+export async function putFeed(env: Env, pid: string, secret: string, feed: { signal: string; etag: string; body: string; now: number }): Promise<void> {
+  await env.DB.batch(await feedStatements(env, pid, secret, feed));
+}
+
+/** `putFeed` as statements, for a batch. */
+export async function feedStatements(env: Env, pid: string, secret: string, { signal, etag, body, now }: { signal: string; etag: string; body: string; now: number }): Promise<D1PreparedStatement[]> {
   const id = await feedId(secret);
   const sealed = await seal(env.SEAL_KEY, `ics:${secret}`, body);
-  await env.DB.batch([
+  return [
     env.DB.prepare('DELETE FROM feeds WHERE pid = ? AND id != ?').bind(pid, id),
     env.DB.prepare('INSERT INTO feeds (id, pid, signal, etag, body, built_at, stale) VALUES (?, ?, ?, ?, ?, ?, 0) ON CONFLICT(id) DO UPDATE SET signal = excluded.signal, etag = excluded.etag, body = excluded.body, built_at = excluded.built_at, stale = 0').bind(id, pid, signal, etag, sealed, now),
-  ]);
+  ];
 }
 
 export async function openFeedBody(env: Env, secret: string, sealed: string): Promise<string | null> {
@@ -210,3 +255,35 @@ export async function moveFeed(env: Env, pid: string, from: string, to: string):
   await putFeed(env, pid, to, { signal: row.signal, etag: row.etag, body, now: row.built_at });
   return true;
 }
+
+/** They left the household: the feed goes, and so does what the Worker kept for it. */
+export async function dropFeed(env: Env, pid: string, now: number): Promise<void> {
+  const record = await loadPerson(env, pid);
+  if (record?.feed) {
+    await revokeFeed(env, record.feed.secret);
+    await savePerson(env, pid, { ...record, feed: undefined });
+  }
+  await env.DB.prepare('DELETE FROM feeds WHERE pid = ?').bind(pid).run();
+  await upsertPersonRow(env, pid, { feed: 0 }, now);
+  log('feed', { served: 'gone' });
+}
+
+// ---- The check's counts (src/check.ts, src/round.ts) ----
+
+/**
+ * The household's shared lists as the check that marked the person's work counted them (an admin or
+ * member: unfiltered), and whether to-dos were shown: a round's `view` reads the lists by them.
+ */
+export interface HouseholdCounts {
+  at: number;
+  todos: boolean;
+  sharedAgenda: Tally;
+  /** The shared to-dos (null when to-dos are off). */
+  sharedTodos: Tally | null;
+}
+
+const countsKey = (pid: string) => `counts:${pid}`;
+
+export const sealCounts = (env: Env, pid: string, counts: HouseholdCounts): Promise<string> => seal(env.SEAL_KEY, countsKey(pid), counts);
+
+export const openCounts = (env: Env, pid: string, sealed: string | null): Promise<HouseholdCounts | null> => unseal<HouseholdCounts>(env.SEAL_KEY, countsKey(pid), sealed);

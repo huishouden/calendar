@@ -165,7 +165,7 @@ export function world(): World {
   // The Fanout entrypoint, called in place (Cloudflare runs each call as its own invocation).
   env.SELF = {
     check: (pids) => checkPeople(env, pids, { fetch: fakeFetch, now: clock.now }),
-    work: (pid) => runWork(env, pid, { fetch: fakeFetch, now: clock.now, next: (p) => env.SELF!.work(p) }),
+    work: (pid, handover) => runWork(env, pid, { fetch: fakeFetch, now: clock.now, handover, next: (p, h) => env.SELF!.work(p, h) }),
     mail: (ids) => checkInboxes(env, ids, { fetch: fakeFetch, now: clock.now, firestoreUrl: FIRESTORE }),
     mailWork: (id) => runMailWork(env, id, { fetch: fakeFetch, now: clock.now, firestoreUrl: FIRESTORE, next: (i) => env.SELF!.mailWork(i) }),
   };
@@ -181,7 +181,7 @@ export async function drain(w: World): Promise<number> {
     const outcome =
       'inbox' in m
         ? await runMailWork(w.env, m.inbox, { fetch: w.fetch, now: w.clock.now, firestoreUrl: FIRESTORE, next: (i) => w.env.SELF!.mailWork(i) })
-        : await runWork(w.env, m.pid, { fetch: w.fetch, now: w.clock.now, next: (p) => w.env.SELF!.work(p) });
+        : await runWork(w.env, m.pid, { fetch: w.fetch, now: w.clock.now, next: (p, h) => w.env.SELF!.work(p, h) });
     if ('retryAfter' in outcome && n > 50) throw new Error('the queue keeps retrying');
   }
   return n;
