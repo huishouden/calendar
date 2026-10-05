@@ -209,6 +209,15 @@ describe('keeping it in step', () => {
 });
 
 describe('fan-out and the queue', () => {
+  test('the signal from the loaded agenda equals the aggregations’ (so a unit needn’t ask twice), for every role', async () => {
+    const { Person } = await import('../src/person');
+    for (const email of ['alice@example.com', 'bob@example.com', 'helen@example.com', 'kim@example.com']) {
+      const p = new Person(w.env, { household, email, refreshToken: refreshFor(email) }, w.fetch);
+      const view = await p.view();
+      expect(p.signalOf(view, await p.load(view), 'x')).toBe(await p.signal(view, 'x'));
+    }
+  });
+
   test('slots: Google people every 5 minutes, feed-only people every 15; a household together', () => {
     for (let m = 0; m < 60; m++) {
       expect(slotsFor(m, GOOGLE_EVERY_MIN).length).toBe(12);

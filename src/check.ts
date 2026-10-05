@@ -3,7 +3,7 @@ import { log } from './log';
 import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
-import { eventRows, feedRowOf, openPerson, savePerson, upsertPersonRow, type PersonRow } from './store';
+import { eventRows, openPerson, savePerson, upsertPersonRow, type PersonRow } from './store';
 import { FULL_EVERY_MS, isEcho } from './sync';
 import { dropFeed, FEED, markWork, SYNC } from './work';
 
@@ -55,9 +55,12 @@ export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}
     calls++;
     return base(url, init);
   };
-  const { results } = await env.DB.prepare(`SELECT * FROM people WHERE pid IN (${pids.map(() => '?').join(', ')}) ORDER BY hh, pid`)
+  // Each person with their feed's signal, in one read.
+  const { results } = await env.DB.prepare(
+    `SELECT people.*, feeds.signal AS feed_signal, feeds.stale AS feed_stale FROM people LEFT JOIN feeds ON feeds.pid = people.pid WHERE people.pid IN (${pids.map(() => '?').join(', ')}) ORDER BY people.hh, people.pid`,
+  )
     .bind(...pids)
-    .all<PersonRow>();
+    .all<CheckRow>();
   const shared: Shared = new Map();
   let done = 0;
   for (const row of results) {
@@ -95,8 +98,10 @@ export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}
   return totals;
 }
 
+type CheckRow = PersonRow & { feed_signal: string | null; feed_stale: number | null };
+
 /** The work one person needs (FEED | SYNC), or 0. */
-async function checkOne(env: Env, row: PersonRow, deps: CheckDeps & { fetch: Fetch; now: number }, shared: Shared, totals: CheckTotals): Promise<number> {
+async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetch; now: number }, shared: Shared, totals: CheckTotals): Promise<number> {
   const { now } = deps;
   const record = await openPerson(env, row.pid, row.record);
   if (!record) return 0;
@@ -156,8 +161,7 @@ async function checkOne(env: Env, row: PersonRow, deps: CheckDeps & { fetch: Fet
   }
   if (google && (signal !== row.signal || !row.full_at || now - row.full_at > FULL_EVERY_MS)) kinds |= SYNC;
   if (record.feed && row.feed === 1) {
-    const feed = await feedRowOf(env, row.pid);
-    if (!feed || feed.signal !== signal || feed.stale) kinds |= FEED;
+    if (!row.feed_signal || row.feed_signal !== signal || row.feed_stale) kinds |= FEED;
   }
   return kinds;
 }

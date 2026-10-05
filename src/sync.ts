@@ -7,7 +7,7 @@ import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, rateLimited, reasonOf, SyncTokenGone, type BatchRequest, type GoogleEvent } from './google/api';
 import { eventId, googleBody, instanceId, overrideBody, regularBody } from './google/events';
 import { applyEdit, dateFormatter, readChange, snapshot, type Edit, type Written } from './backsync';
-import { deleteEventRow, eventRows, loadPerson, personRow, putEventRow, savePerson, upsertPersonRow, type EventRow, type PersonRecord } from './store';
+import { deleteEventRow, eventRows, loadPerson, openPerson, personRow, type PersonRow, putEventRow, savePerson, upsertPersonRow, type EventRow, type PersonRecord } from './store';
 
 /**
  * Keeping a person's "Huishouden" Google calendar in step with what they see in the household,
@@ -55,6 +55,8 @@ const zero = (): SyncCounts => ({ changes: 0, echoes: 0, applied: 0, refused: 0,
 
 export interface SyncDeps {
   fetch?: Fetch;
+  /** The person's row, already read (src/work.ts). */
+  row?: PersonRow;
   now?: number;
   /** Firestore's REST base (tests: the emulator). */
   firestoreUrl?: string;
@@ -85,8 +87,9 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
   const now = deps.now ?? Date.now();
   const fetchImpl = deps.fetch ?? ((url, init) => fetch(url, init));
   const counts = zero();
-  const record = await loadPerson(env, pid);
-  const row = await personRow(env, pid);
+  // The work hands over the row it took with its lease (one D1 read fewer each).
+  const row = deps.row ?? (await personRow(env, pid));
+  const record = row ? await openPerson(env, pid, row.record) : null;
   if (!record?.google || !row) {
     await upsertPersonRow(env, pid, { google: 0 }, now);
     return counts;
@@ -152,7 +155,9 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
   }
   // The household's home zone when it has one, so "9:00" is 9:00 at home wherever the phone is.
   const tz = zoneOf(view, record);
-  const signal = await person.signal(view, signalExtra(view, record));
+  // The agenda is read in any case (a round runs only when a check saw a change); the signal comes from it.
+  let loaded = await person.load(view);
+  const signal = person.signalOf(view, loaded, signalExtra(view, record));
   const full = !row.full_at || now - row.full_at > FULL_EVERY_MS || rows.length === 0;
   if (signal === row.signal && real.length === 0 && !full) {
     await upsertPersonRow(env, pid, { last_sync: now, last_ok: now, last_error: null, ...(nextSyncToken && nextSyncToken !== row.sync_token && changed.length > 0 ? { sync_token: nextSyncToken } : {}) }, now);
@@ -161,7 +166,6 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
   }
   counts.full = true;
   await loadExportLang(record.lang);
-  let loaded = await person.load(view);
   let events = exportFor(loaded, view, record);
 
   // 3. Google's changes, carried back.
