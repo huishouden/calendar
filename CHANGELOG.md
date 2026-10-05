@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2](https://github.com/huishouden/calendar/compare/v0.2.1...v0.2.2) (2026-10-05)
+
+### Bug Fixes
+
+* Rebuild against the re-tagged kit ([add37fa](https://github.com/huishouden/calendar/commit/add37faf4d8238f32a301bd564083d7d986c9856))
+
 ## 0.2.1 (2026-10-05)
 
 ### Performance
