@@ -122,7 +122,81 @@ async function touch(env: Env, key: string, now: number): Promise<void> {
   await env.DB.prepare('UPDATE lists SET used_at = ?1 WHERE key = ?2 AND used_at < ?3').bind(now, key, now - 3_600_000).run().catch(dbFailed);
 }
 
-/** Deletes copies nobody has used for `LIST_FORGET_MS` (a member who left, a household gone). */
+/**
+ * Deletes copies nobody has used for `LIST_FORGET_MS` (a member who left, a household gone), and
+ * rounds (src/round.ts) left unfinished for a day: their person's work went another way.
+ */
 export async function forgetLists(env: Env, now: number): Promise<void> {
-  await env.DB.prepare('DELETE FROM lists WHERE used_at < ?').bind(now - LIST_FORGET_MS).run();
+  const day = now - 24 * 3_600_000;
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM lists WHERE used_at < ?').bind(now - LIST_FORGET_MS),
+    env.DB.prepare('DELETE FROM round_items WHERE pid IN (SELECT pid FROM people WHERE round_at < ?)').bind(day),
+    env.DB.prepare('UPDATE people SET round = NULL, round_kind = NULL, round_at = NULL WHERE round_at < ?').bind(day),
+  ]);
+}
+
+/** A list to read in a round's unit (src/round.ts): its key, its aggregation already asked, how to read it. */
+export interface ListPlan {
+  key: string;
+  tally: Tally;
+  reads: ListReads;
+}
+
+/**
+ * Lists whose aggregations an earlier unit asked: every kept copy in one D1 read, then from
+ * Firestore only what changed, as `readList` decides. The copies to store come back as statements
+ * for the unit's batch. `keptOnly`: null as soon as a copy doesn't match, nothing asked of Firestore.
+ */
+export async function readLists(env: Env, plans: ListPlan[], now: number, { keptOnly = false } = {}): Promise<{ docs: Doc[][]; outcomes: ListOutcome[]; statements: D1PreparedStatement[] } | null> {
+  const statements: D1PreparedStatement[] = [];
+  const rows = plans.length
+    ? await env.DB.prepare(`SELECT key, body, at, used_at FROM lists WHERE key IN (${plans.map(() => '?').join(', ')})`)
+        .bind(...plans.map((p) => p.key))
+        .all<{ key: string; body: string; at: number; used_at: number }>()
+        .then((r) => r.results)
+        .catch((e: unknown) => dbFailed(e) ?? [])
+    : [];
+  const byKey = new Map(rows.map((r) => [r.key, r]));
+  const docs: Doc[][] = [];
+  const outcomes: ListOutcome[] = [];
+  for (const { key, tally, reads } of plans) {
+    const row = byKey.get(key);
+    const kept = row && now - row.at < LIST_MAX_AGE_MS && row.at <= now ? await unseal<Kept>(env.SEAL_KEY, `list:${key}`, row.body) : null;
+    let found: { docs: Doc[]; outcome: ListOutcome } | null = null;
+    if (kept && row) {
+      if (same(tallyOf(kept.docs), tally)) {
+        if (row.used_at < now - 3_600_000) statements.push(env.DB.prepare('UPDATE lists SET used_at = ?1 WHERE key = ?2').bind(now, key));
+        found = { docs: kept.docs, outcome: 'kept' };
+      } else if (reads.since) {
+        const changed = await reads.since(newest(kept.docs));
+        const merged = new Map(kept.docs.map((d) => [d.path, d]));
+        for (const d of changed) merged.set(d.path, d);
+        const all = [...merged.values()];
+        if (same(tallyOf(all), tally)) {
+          statements.push(await storeStatement(env, key, all, row.at, now));
+          found = { docs: all, outcome: 'delta' };
+        }
+      }
+    }
+    // Only the kept copies (a round's later unit): one that changed means the round's lists did.
+    if (!found && keptOnly) return null;
+    if (!found) {
+      const all = await reads.all();
+      statements.push(await storeStatement(env, key, all, now, now));
+      found = { docs: all, outcome: 'full' };
+    }
+    docs.push(found.docs);
+    outcomes.push(found.outcome);
+  }
+  return { docs, outcomes, statements };
+}
+
+/** `write` as a statement: the copy stored, or (too big for a row) the old one deleted. */
+async function storeStatement(env: Env, key: string, docs: Doc[], at: number, now: number): Promise<D1PreparedStatement> {
+  const body = await seal(env.SEAL_KEY, `list:${key}`, { docs } satisfies Kept);
+  if (body.length > MAX_SEALED) {
+    log('lists', { kept: false, reason: 'too-big' });
+    return env.DB.prepare('DELETE FROM lists WHERE key = ?').bind(key);
+  }
+  return env.DB.prepare('INSERT INTO lists (key, body, at, used_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(key) DO UPDATE SET body = excluded.body, at = excluded.at, used_at = excluded.used_at').bind(key, body, at, now);
 }

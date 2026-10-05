@@ -4,6 +4,7 @@ import { decodeFields, encodeFields } from '@huishouden/pwa-kit/firestore-rest';
 import { batchBody, parseBatch } from './google/api';
 import { googleBody } from './google/events';
 import { snapshot } from './backsync';
+import { assembleIcs, eventIcs, keepWitness, partition } from './round';
 
 /** Zones warmed at startup: the runtime's zone data for each, used by the VTIMEZONE and the clock. */
 const ZONES = ['Europe/Amsterdam', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'UTC'];
@@ -40,6 +41,11 @@ export function warm(): void {
           for (const timeZone of ZONES) {
             const events = exportEvents({ agenda, todos: [], me: 'warm@invalid', role: 'admin', lang, timeZone, settings: DEFAULT_CALENDAR_SETTINGS });
             exportIcs(events, { householdId: 'warm', timeZone, lang, now: day });
+            // The same calendar as a round's units make it (src/round.ts).
+            const input = { me: 'warm@invalid', role: 'admin' as const, settings: DEFAULT_CALENDAR_SETTINGS };
+            partition({ agenda, todos: [] }, input, 2);
+            const options = { householdId: 'warm', timeZone, lang, now: day };
+            assembleIcs(events.map((e) => ({ s: e.start, k: e.key, t: eventIcs(e, options) })), keepWitness([], events, 'warm', timeZone, lang), options);
             const bodies = events.map((e) => (snapshot(e), googleBody(e, { id: 'warm', householdId: 'warm', timeZone })));
             batchBody('b', bodies.map((body) => ({ method: 'PUT' as const, path: '/calendars/warm/events/warm', body })));
           }

@@ -2,6 +2,7 @@ import { FirestoreError } from '@huishouden/pwa-kit/firestore-rest';
 import { FirebaseAuthError } from '@huishouden/pwa-kit/firebase-auth-rest';
 import type { Env, Fetch } from './env';
 import { log } from './log';
+import type { Tally } from './lists';
 import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
@@ -182,9 +183,13 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
   }
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
   let signal: string;
+  let counts: string;
   try {
     const view = await person.view();
-    signal = await person.signal(view, signalExtra(view, record), shared);
+    const read = await person.signalAndCounts(view, signalExtra(view, record), shared);
+    signal = read.signal;
+    // What a round's first unit would ask again (src/round.ts `view`), kept with the signal.
+    counts = JSON.stringify({ at: now, restricted: view.restricted, todos: view.settings.todos, counts: read.counts } satisfies HouseholdCounts);
   } catch (e) {
     if (e instanceof NotMember) {
       if (record.feed) await dropFeed(env, row.pid, now);
@@ -198,13 +203,22 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
     }
     throw e;
   }
+  const found = (google && signal !== row.signal ? SYNC : 0) | (record.feed && row.feed === 1 && (!row.feed_signal || row.feed_signal !== signal) ? FEED : 0);
   if (signal !== row.hh_signal) {
     // Seen changing (not the first time it is seen): the household counts as active for an hour.
-    await env.DB.prepare('UPDATE people SET hh_signal = ?, hh_signal_at = ? WHERE pid = ?').bind(signal, row.hh_signal ? now : 0, row.pid).run();
+    await env.DB.prepare('UPDATE people SET hh_signal = ?, hh_signal_at = ?, hh_counts = ? WHERE pid = ?').bind(signal, row.hh_signal ? now : 0, counts, row.pid).run();
+  } else if (found) {
+    await env.DB.prepare('UPDATE people SET hh_counts = ? WHERE pid = ?').bind(counts, row.pid).run();
   }
-  if (google && signal !== row.signal) kinds |= SYNC;
-  if (record.feed && row.feed === 1 && (!row.feed_signal || row.feed_signal !== signal)) kinds |= FEED;
-  return kinds;
+  return kinds | found;
+}
+
+/** The aggregations a check asked for the person, by slot (src/person.ts `signalAndCounts`), and for which view. */
+export interface HouseholdCounts {
+  at: number;
+  restricted: boolean;
+  todos: boolean;
+  counts: (Tally | null)[];
 }
 
 /** The work due whatever the household did: a sync not fully rebuilt in FULL_EVERY_MS, a feed a request marked stale. */

@@ -6,7 +6,7 @@ import { personId } from '../src/store';
 import { serveFeed, FEED_PATH } from '../src/feed';
 import { captureLogs } from '../src/log';
 import { apiRequest, drain, household, refreshFor, readDoc, refresh, resetFirestore, seed, world, writeDoc, type World } from './helpers/world';
-import { FEED_MAX_AGE_MS, type WorkOutcome } from '../src/work';
+import { FEED_MAX_AGE_MS, type Handover, type WorkOutcome } from '../src/work';
 
 /** An invented home in another zone than the person's device (Europe/Amsterdam). */
 const HOME = { address: '12 Example Lane, Springfield, Illinois 62701', lat: 39.7817, lng: -89.6501, timeZone: 'America/Chicago', setBy: 'alice@example.com', updatedAt: 1 };
@@ -42,7 +42,7 @@ let checksAsked: string[][] = [];
  * A feed request. Global `fetch` fails meanwhile except inside another invocation (`env.SELF`): the
  * request itself never reaches Firestore, Google or Firebase Auth.
  */
-async function get(secret: string, headers: Record<string, string> = {}, method = 'GET', { work }: { work?: (pid: string) => Promise<WorkOutcome> } = {}): Promise<Response> {
+async function get(secret: string, headers: Record<string, string> = {}, method = 'GET', { work }: { work?: (pid: string, handover?: Handover) => Promise<WorkOutcome> } = {}): Promise<Response> {
   const real = globalThis.fetch;
   const self = w.env.SELF!;
   let inSelf = 0;
@@ -50,10 +50,10 @@ async function get(secret: string, headers: Record<string, string> = {}, method 
     check: async (pids) => (checksAsked.push(pids), { checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, deferred: [], paused: false, quiet: 0 }),
     mail: self.mail,
     mailWork: self.mailWork,
-    work: async (pid) => {
+    work: async (pid, handover) => {
       inSelf++;
       try {
-        return await (work ?? self.work)(pid);
+        return await (work ?? self.work)(pid, handover);
       } finally {
         inSelf--;
       }

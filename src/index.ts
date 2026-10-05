@@ -7,7 +7,7 @@ import { log } from './log';
 import { MAX_CALLS, runCron } from './tick';
 import { checkInboxes, runMailCron, type MailTotals } from './mail/check';
 import { runMailWork } from './mail/work';
-import { runWork, type WorkMessage, type WorkOutcome } from './work';
+import { runWork, type Handover, type WorkMessage, type WorkOutcome } from './work';
 import { warm } from './warm';
 
 export { Ticker } from './ticker';
@@ -27,8 +27,8 @@ export class Fanout extends WorkerEntrypoint<Env> implements FanoutRpc {
     return checkPeople(this.env, pids, { googleEvery });
   }
 
-  async work(pid: string): Promise<WorkOutcome> {
-    return runWork(this.env, pid, { next: (p) => this.env.SELF!.work(p) });
+  async work(pid: string, handover?: Handover): Promise<WorkOutcome> {
+    return runWork(this.env, pid, { handover, next: (p, h) => this.env.SELF!.work(p, h) });
   }
 
   async mail(ids: string[]): Promise<MailTotals> {
@@ -67,7 +67,7 @@ export default {
       const body = message.body;
       const outcome = await ('inbox' in body
         ? runMailWork(env, body.inbox, { next: env.SELF ? (i) => env.SELF!.mailWork(i) : undefined })
-        : runWork(env, body.pid, { next: env.SELF ? (p) => env.SELF!.work(p) : undefined })
+        : runWork(env, body.pid, { next: env.SELF ? (p, h) => env.SELF!.work(p, h) : undefined })
       ).catch((): WorkOutcome => ({ retryAfter: 60, reason: 'error' }));
       if ('done' in outcome) {
         message.ack();

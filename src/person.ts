@@ -197,6 +197,14 @@ export class Person {
    * item added, changed or removed moves it.
    */
   async signal(view: View, extra = '', shared?: Shared): Promise<string> {
+    return (await this.signalAndCounts(view, extra, shared)).signal;
+  }
+
+  /**
+   * The signal, and each list's count and sum by slot (null: not read, the rules refused it or
+   * to-dos are off): what a round's `view` step would ask again (src/round.ts).
+   */
+  async signalAndCounts(view: View, extra = '', shared?: Shared): Promise<{ signal: string; counts: (Tally | null)[] }> {
     const zero = { count: 0, sums: { updatedAt: 0 } };
     const common = (collection: string) => {
       const run = () => this.db.aggregate(this.base, collection, { where: this.shared(view) }, ['updatedAt']);
@@ -211,18 +219,66 @@ export class Person {
       }
       return hit;
     };
-    const [agenda, personal, todos, personalTodos] = await Promise.all([
+    const counts: (Tally | null)[] = await Promise.all([
       common('agenda'),
-      this.optional(() => this.db.aggregate(this.base, PERSONAL_AGENDA, { where: this.mine(view) }, ['updatedAt']), zero),
-      view.settings.todos ? common('todos') : Promise.resolve(zero),
-      view.settings.todos ? this.optional(() => this.db.aggregate(this.base, PERSONAL_TODOS, { where: this.mine(view) }, ['updatedAt']), zero) : Promise.resolve(zero),
+      this.optional(() => this.db.aggregate(this.base, PERSONAL_AGENDA, { where: this.mine(view) }, ['updatedAt']), null),
+      view.settings.todos ? common('todos') : Promise.resolve(null),
+      view.settings.todos ? this.optional(() => this.db.aggregate(this.base, PERSONAL_TODOS, { where: this.mine(view) }, ['updatedAt']), null) : Promise.resolve(null),
     ]);
-    return signalFrom(view, [agenda, personal, todos, personalTodos], extra);
+    return { signal: signalFrom(view, counts.map((c) => c ?? zero), extra), counts };
   }
 
   /** The same signal from what `load` read: no aggregations. */
   signalOf(view: View, loaded: Loaded, extra = ''): string {
     return signalFrom(view, loaded.tally, extra);
+  }
+
+  /**
+   * The lists a calendar is built from, as this person may read them, in signal order: the
+   * household's agenda, their personal agenda, and with to-dos on, the household's to-dos and their
+   * personal ones. A personal list the rules refuse (older rules, a kid) is empty.
+   */
+  listSpecs(view: View): ListSpec[] {
+    const specs: ListSpec[] = [
+      { slot: 0, collection: 'agenda', where: this.shared(view), optional: false },
+      { slot: 1, collection: PERSONAL_AGENDA, where: this.mine(view), optional: true },
+    ];
+    if (view.settings.todos) {
+      specs.push({ slot: 2, collection: 'todos', where: this.shared(view), optional: false });
+      specs.push({ slot: 3, collection: PERSONAL_TODOS, where: this.mine(view), optional: true });
+    }
+    return specs;
+  }
+
+  /** The key of a list's kept copy (src/lists.ts): the query itself, so only people whose query is the same share one. */
+  listKeyOf(spec: ListSpec): Promise<string> {
+    return listKey(this.record.household, spec.collection, JSON.stringify(spec.where));
+  }
+
+  asks(spec: ListSpec): ListReads {
+    const { collection, where } = spec;
+    return {
+      tally: () => this.db.aggregate(this.base, collection, { where }, ['updatedAt']),
+      all: () => this.db.query(this.base, collection, { where }),
+      // Only an unfiltered list: a filter and a range on `updatedAt` together need an index of their own.
+      ...(where.length ? {} : { since: (after: number) => this.db.query(this.base, collection, { where: [{ field: 'updatedAt', op: 'GREATER_THAN', value: after }] }) }),
+    };
+  }
+
+  /**
+   * One list, from the copy kept since the last load where its count and sum of `updatedAt` say it
+   * is still right, and otherwise from what changed or the whole list (src/lists.ts). Null when the
+   * rules refuse a personal list.
+   */
+  async readSpec(spec: ListSpec, now = Date.now()): Promise<{ docs: Doc[]; outcome: ListOutcome } | null> {
+    const read = async () => readList(this.env, await this.listKeyOf(spec), this.asks(spec), now);
+    return spec.optional ? this.optional(read, null) : read();
+  }
+
+  /** The list's count and sum of `updatedAt` (one aggregation); null when the rules refuse a personal list. */
+  async countOf(spec: ListSpec): Promise<Tally | null> {
+    const read = () => this.asks(spec).tally();
+    return spec.optional ? this.optional(read, null) : read();
   }
 
   /**
@@ -232,34 +288,37 @@ export class Person {
    */
   async load(view: View, now = Date.now()): Promise<Loaded> {
     const reads: Record<string, ListOutcome> = {};
-    // The copy's key is the query itself: only people whose query is the same share one.
-    const list = async (collection: string, where: FieldFilter[]): Promise<Doc[]> => {
-      const ask: ListReads = {
-        tally: () => this.db.aggregate(this.base, collection, { where }, ['updatedAt']),
-        all: () => this.db.query(this.base, collection, { where }),
-        // Only an unfiltered list: a filter and a range on `updatedAt` together need an index of their own.
-        ...(where.length ? {} : { since: (after: number) => this.db.query(this.base, collection, { where: [{ field: 'updatedAt', op: 'GREATER_THAN', value: after }] }) }),
-      };
-      const { docs, outcome } = await readList(this.env, await listKey(this.record.household, collection, JSON.stringify(where)), ask, now);
-      reads[collection] = outcome;
-      return docs;
-    };
-    const [agenda, personal, todos, personalTodos] = await Promise.all([
-      list('agenda', this.shared(view)),
-      this.optional(() => list(PERSONAL_AGENDA, this.mine(view)), []),
-      view.settings.todos ? list('todos', this.shared(view)) : Promise.resolve([]),
-      view.settings.todos ? this.optional(() => list(PERSONAL_TODOS, this.mine(view)), []) : Promise.resolve([]),
-    ]);
-    return {
-      tally: [agenda, personal, todos, personalTodos].map(tallyOf),
-      reads,
-      agenda: [...agenda, ...personal].map((d) => ({ ...toAgendaItem(d.id, d.data), ...(d.path.includes(`/${PERSONAL_AGENDA}/`) ? { audience: toAgendaItem(d.id, d.data).audience ?? [] } : {}) })),
-      todos: [...todos, ...personalTodos].map((d) => toTodoItem(d.id, d.data)),
-    };
+    const specs = this.listSpecs(view);
+    const read = await Promise.all(specs.map((spec) => this.readSpec(spec, now)));
+    const docs: Doc[][] = [[], [], [], []];
+    read.forEach((r, i) => {
+      if (!r) return;
+      docs[specs[i].slot] = r.docs;
+      reads[specs[i].collection] = r.outcome;
+    });
+    return { ...loadedFrom(docs), reads };
   }
 }
 
-const signalFrom = (view: View, tallies: Tally[], extra: string): string =>
+/** A list a calendar is built from: its place in the signal (`slot`), its query, whether the rules may refuse it. */
+export interface ListSpec {
+  slot: 0 | 1 | 2 | 3;
+  collection: string;
+  where: FieldFilter[];
+  optional: boolean;
+}
+
+/** The agenda, to-dos and tally from the four lists' documents, by slot (an unread list empty). */
+export function loadedFrom(docs: Doc[][]): Omit<Loaded, 'reads'> {
+  const [agenda, personal, todos, personalTodos] = [0, 1, 2, 3].map((i) => docs[i] ?? []);
+  return {
+    tally: [agenda, personal, todos, personalTodos].map(tallyOf),
+    agenda: [...agenda, ...personal].map((d) => ({ ...toAgendaItem(d.id, d.data), ...(d.path.includes(`/${PERSONAL_AGENDA}/`) ? { audience: toAgendaItem(d.id, d.data).audience ?? [] } : {}) })),
+    todos: [...todos, ...personalTodos].map((d) => toTodoItem(d.id, d.data)),
+  };
+}
+
+export const signalFrom = (view: View, tallies: Tally[], extra: string): string =>
   contentHash(JSON.stringify([...tallies, view.role, view.settingsAt, view.settings, extra]));
 
 /** Firestore said the project's daily quota is used up (429 RESOURCE_EXHAUSTED; Spark resets at midnight Pacific). */
