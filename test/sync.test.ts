@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
 import { syncPerson, MAX_WRITES } from '../src/sync';
-import { runCron, runPart, nextAlarm, pack, periodsFor, CHUNK, CAPACITY, slotsFor, GOOGLE_EVERY_MIN, FEED_EVERY_MIN, MAX_CALLS, READS_PER_CHECK } from '../src/tick';
+import { runCron, runPart, nextAlarm, pack, periodsFor, CHUNK, CAPACITY, slotsFor, GOOGLE_EVERY_MIN, FEED_EVERY_MIN, MAX_CALLS, READS_PER_CHECK, googleChecksPerDay } from '../src/tick';
 import { runWork, SYNC, FEED, markWork } from '../src/work';
 import { checkPeople } from '../src/check';
 import { personId, loadPerson } from '../src/store';
@@ -265,10 +265,13 @@ describe('fan-out and the queue', () => {
 
   test('a Firestore read budget: the checks slow down rather than go over it', () => {
     expect(periodsFor(1000, 1000)).toEqual({ google: 5, feed: 15 });
-    // 20 people with Google and 20 with a feed: every 5 minutes would be 38,400 reads a day.
-    expect(periodsFor(20, 20, 20_000)).toEqual({ google: 15, feed: 15 });
+    // 20 people with Google and 20 with a feed: Google every 5 minutes (a household side every 15
+    // while quiet, a quarter of the day active) would be 28,800 reads a day.
+    expect(periodsFor(20, 20, 20_000)).toEqual({ google: 20, feed: 20 });
     const p = periodsFor(20, 20, 20_000);
-    expect((20 * 1440 / p.google + 20 * 1440 / p.feed) * READS_PER_CHECK).toBeLessThanOrEqual(20_000);
+    expect((20 * googleChecksPerDay(p.google) + 20 * 1440 / p.feed) * READS_PER_CHECK).toBeLessThanOrEqual(20_000);
+    // Google people alone: 23 keep 5-minute checks within 20,000 (13 when every check read the household).
+    expect(periodsFor(23, 0, 20_000)).toEqual({ google: 5, feed: 15 });
     expect(periodsFor(5, 0, 20_000)).toEqual({ google: 5, feed: 15 });
     expect(periodsFor(1000, 0, 20_000)).toEqual({ google: 60, feed: 60 });
   });

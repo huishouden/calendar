@@ -47,7 +47,8 @@ export const globalFetch: Fetch = (url, init) => fetch(url, init);
 
 /** What the cron fans out to (src/index.ts `Fanout`), and the queue's next unit. */
 export interface FanoutRpc {
-  check(pids: string[]): Promise<import('./check').CheckTotals>;
+  /** `googleEvery`: the cron's minutes between Google people's checks (src/check.ts `householdDue`). */
+  check(pids: string[], googleEvery?: number): Promise<import('./check').CheckTotals>;
   work(pid: string): Promise<import('./work').WorkOutcome>;
   /** Spending's alert inboxes: a few checked (src/mail/check.ts), and one unit of an inbox's import (src/mail/work.ts). */
   mail(ids: string[]): Promise<import('./mail/check').MailTotals>;

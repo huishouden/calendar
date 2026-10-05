@@ -1,6 +1,7 @@
 import type { Env, Fetch } from './env';
 import { log } from './log';
-import { checkPeople, type CheckTotals } from './check';
+import { checkPeople, QUIET_EVERY_MIN, type CheckTotals } from './check';
+import { forgetLists } from './lists';
 import { markWork, REQUEUE_MS, runWork, type WorkOutcome } from './work';
 
 /**
@@ -18,8 +19,20 @@ import { markWork, REQUEUE_MS, runWork, type WorkOutcome } from './work';
 
 export const GOOGLE_EVERY_MIN = 5;
 export const FEED_EVERY_MIN = 15;
-/** Firestore reads one check costs: the household and settings (2), the person's two lists (2), and their share of the household's lists. */
-export const READS_PER_CHECK = 5;
+/**
+ * Billed Firestore reads one household-side check costs: the household and settings (2 documents),
+ * and four aggregations (the person's two lists, the household's two, shared with members checked in
+ * the same run), each billed at least one read even when it counts nothing.
+ */
+export const READS_PER_CHECK = 6;
+/** The share of the day a household counts as active (checked at every Google check, src/check.ts `householdDue`), for the budget. */
+export const ACTIVE_SHARE = 0.25;
+
+/** Household-side checks a Google person gets a day with checks every `every` minutes: every QUIET_EVERY_MIN while quiet, every check while active. */
+export const googleChecksPerDay = (every: number): number => {
+  const quiet = 1440 / Math.max(QUIET_EVERY_MIN, every);
+  return quiet + ACTIVE_SHARE * (1440 / every - quiet);
+};
 const PERIODS = [5, 10, 15, 20, 30, 60];
 
 export interface Periods {
@@ -35,7 +48,7 @@ export interface Periods {
  * checks slow down instead.
  */
 export function periodsFor(google: number, feedOnly: number, budget?: number, capacity = CAPACITY): Periods {
-  const cost = (p: Periods) => (google * 1440) / p.google + (feedOnly * 1440) / p.feed;
+  const cost = (p: Periods) => google * googleChecksPerDay(p.google) + (feedOnly * 1440) / p.feed;
   // People due in a minute, with room for slots that come out uneven.
   const perMinute = (p: Periods) => (1.25 * google) / p.google + (1.25 * feedOnly) / p.feed;
   for (const g of PERIODS.filter((p) => p >= GOOGLE_EVERY_MIN)) {
@@ -123,7 +136,7 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
   const now = deps.now ?? Date.now();
   const part = deps.part;
   const minute = Math.floor(now / 60_000) % 60;
-  const totals: Record<string, number> = { due: 0, calls: 0, checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, deferred: 0, swept: 0, worked: 0 };
+  const totals: Record<string, number> = { due: 0, calls: 0, checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, quiet: 0, deferred: 0, swept: 0, worked: 0 };
   const pause = await env.DB.prepare("SELECT value FROM meta WHERE key = 'firestore-pause'").first<{ value: number }>();
   if (pause && pause.value > now) {
     log('tick', { minute, paused: 'firestore-quota' });
@@ -137,7 +150,7 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
   ).all<{ pid: string; hh: string | null }>();
   totals.due = results.length;
 
-  const check = (pids: string[]): Promise<CheckTotals> => (env.SELF ? env.SELF.check(pids) : checkPeople(env, pids, deps));
+  const check = (pids: string[]): Promise<CheckTotals> => (env.SELF ? env.SELF.check(pids, periods.google) : checkPeople(env, pids, { ...deps, googleEvery: periods.google }));
   const work = (pid: string): Promise<WorkOutcome> => (env.SELF ? env.SELF.work(pid) : runWork(env, pid, { ...deps, now }));
 
   const chunks = pack(results);
@@ -161,7 +174,7 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
         failed++;
         continue;
       }
-      for (const k of ['checked', 'marked', 'sent', 'echoes', 'skipped', 'errors'] as const) totals[k] += a.value[k];
+      for (const k of ['checked', 'marked', 'sent', 'echoes', 'skipped', 'errors', 'quiet'] as const) totals[k] += a.value[k] ?? 0;
       deferred.push(...a.value.deferred);
       paused ||= a.value.paused;
     }
@@ -184,6 +197,9 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
     const outcome = await work(pid).catch(() => null);
     if (outcome && 'done' in outcome) totals.worked++;
   }
+
+  // Kept lists nobody has used for a week (src/lists.ts), once an hour.
+  if (part === 0 && minute === 0) await forgetLists(env, now).catch(() => undefined);
 
   // The portal's "Updated ... ago" for everyone checked in this minute, when all of them were.
   if (!failed && !paused && totals.deferred === 0) {

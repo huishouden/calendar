@@ -23,8 +23,8 @@ warm();
  */
 
 export class Fanout extends WorkerEntrypoint<Env> implements FanoutRpc {
-  async check(pids: string[]): Promise<CheckTotals> {
-    return checkPeople(this.env, pids);
+  async check(pids: string[], googleEvery?: number): Promise<CheckTotals> {
+    return checkPeople(this.env, pids, { googleEvery });
   }
 
   async work(pid: string): Promise<WorkOutcome> {
