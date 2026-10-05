@@ -131,6 +131,7 @@ export function world(): World {
     GOOGLE_CLIENT_SECRET: 'demo-secret',
     SEAL_KEY: sealKey,
     SITE_URL: 'https://site.example',
+    GOOGLE_REDIRECT_URIS: 'https://site.example/my-calendar https://site.example/spending/',
     ALLOWED_ORIGINS: 'https://site.example',
     CALENDAR_NAME: 'Huishouden',
     FIRESTORE_URL: FIRESTORE,

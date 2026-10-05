@@ -12,6 +12,11 @@ export interface Env {
   /** Secret: 32 random bytes, base64. */
   SEAL_KEY: string;
   SITE_URL: string;
+  /**
+   * Space-separated pages Google may send a person back to with a code ("Continue in this tab"):
+   * each also an Authorized redirect URI of the OAuth client. Unset: the popup only (`postmessage`).
+   */
+  GOOGLE_REDIRECT_URIS?: string;
   /** Space-separated origins the portal's Calendar page calls from. */
   ALLOWED_ORIGINS: string;
   /** The Google calendar's name: "Huishouden". */

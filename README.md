@@ -439,6 +439,12 @@ Google sync again.
 3. Add the scope `.../auth/calendar.app.created` to the OAuth consent screen (Google Auth
    Platform > Data access > Add or remove scopes). Without it, the consent screen still works for
    test users but shows the scope as unlisted.
+4. "Continue in this tab" (when the browser blocks Google's window, or it opens out of sight): the
+   pages Google sends the code back to are Authorized redirect URIs of the web client (APIs &
+   Services > Credentials) and are listed in `GOOGLE_REDIRECT_URIS` in `wrangler.toml`, exactly:
+   `https://<site>/my-calendar` and `https://<site>/spending/`. The app sends that page as
+   `redirectUri` with the code, and the Worker exchanges it with that `redirect_uri`; without one it
+   is the popup's `postmessage`. Any other page is refused (400 `redirect-uri`).
 
 Until `GOOGLE_CLIENT_SECRET` is set, the portal shows only the feed.
 

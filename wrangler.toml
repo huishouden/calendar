@@ -59,6 +59,9 @@ GOOGLE_CLIENT_ID = "865471112898-s88n43rlk8m2iv200lmejmj5k4rrb2sh.apps.googleuse
 # The suite's site: the portal's Calendar page calls this Worker from here.
 SITE_URL = "https://huishouden-piekstra.web.app"
 ALLOWED_ORIGINS = "https://huishouden-piekstra.web.app"
+# "Continue in this tab": the pages Google may send a code back to, exactly as the OAuth client's
+# Authorized redirect URIs list them (Calendar's page in the portal, Spending's alert inbox).
+GOOGLE_REDIRECT_URIS = "https://huishouden-piekstra.web.app/my-calendar https://huishouden-piekstra.web.app/spending/"
 CALENDAR_NAME = "Huishouden"
 # Firestore reads a day the checks may use, of the free plan's 50,000 shared with every app
 # (README, "Many households"). They check less often rather than go over it.
@@ -101,6 +104,7 @@ FIREBASE_PROJECT_ID = "huishouden-staging"
 GOOGLE_CLIENT_ID = "212329703141-k8rtusehnq9a7c7okd3e6c8md99u7gj2.apps.googleusercontent.com"
 SITE_URL = "https://huishouden-staging.web.app"
 ALLOWED_ORIGINS = "https://huishouden-staging.web.app http://localhost:5173 http://127.0.0.1:5173"
+GOOGLE_REDIRECT_URIS = "https://huishouden-staging.web.app/my-calendar https://huishouden-staging.web.app/spending/"
 CALENDAR_NAME = "Huishouden (staging)"
 # Staging's reads mostly go to the apps' CI.
 FIRESTORE_CHECK_READS = "5000"
