@@ -16,7 +16,7 @@ minutes, with no app open ("Spending's alert inboxes" below).
 
 What a person sees is what they may see in the household, in their language, with their settings.
 Helpers and kids get nothing private and no bills. Health items go only to the person, their carers
-and the admins, and by default read "Medicine for Ana" with no detail, because calendars are often
+and the admins, and by default read "Medicine for Ana" or "Appointment for Ana" with no detail, because calendars are often
 shared.
 
 The Worker acts **only as the person** with their own Firebase sign-in, so the household's Firestore
