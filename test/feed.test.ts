@@ -283,6 +283,32 @@ describe('the API', () => {
     expect((await res2.json()) as unknown).toEqual({ error: 'unavailable' });
   });
 
+  test('the ID token: Firestore’s check is the one that counts (forged: 401); another project’s or expired claims: 401 without a call', async () => {
+    const forged = async (url: string, init?: RequestInit) =>
+      url.includes('/documents/households/') ? Response.json({ error: { code: 401, message: 'Request had invalid authentication credentials.', status: 'UNAUTHENTICATED' } }, { status: 401 }) : w.fetch(url, init);
+    expect((await handleApi(w.env, apiRequest(`/api/status?household=${household}`, 'alice@example.com'), undefined, { fetch: forged, now: w.clock.now })).status).toBe(401);
+    let calls = 0;
+    const counting = async (url: string, init?: RequestInit) => (calls++, w.fetch(url, init));
+    const b64 = (o: object) => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const now = Math.floor(Date.now() / 1000);
+    for (const claims of [
+      { aud: 'another-project', iss: 'https://securetoken.google.com/another-project', exp: now + 3600, email: 'alice@example.com', email_verified: true, user_id: 'u-alice' },
+      { aud: 'demo-huishouden-calendar', iss: 'https://securetoken.google.com/demo-huishouden-calendar', exp: now - 10, email: 'alice@example.com', email_verified: true, user_id: 'u-alice' },
+      { aud: 'demo-huishouden-calendar', iss: 'https://securetoken.google.com/demo-huishouden-calendar', exp: now + 3600, email: 'alice@example.com', email_verified: false, user_id: 'u-alice' },
+    ]) {
+      const req = new Request(`https://calendar.example/api/status?household=${household}`, { headers: { Origin: 'https://site.example', Authorization: `Bearer ${b64({ alg: 'none' })}.${b64(claims)}.` } });
+      expect((await handleApi(w.env, req, undefined, { fetch: counting, now: w.clock.now })).status).toBe(401);
+    }
+    expect(calls).toBe(0);
+  });
+
+  test('the same refresh token again (each Make or rotate sends it): no exchange with Firebase Auth', async () => {
+    await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: 'Europe/Amsterdam' });
+    const before = w.authCalls.filter((c) => c === 'token').length;
+    expect((await call('/api/feed/rotate', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com') })).status).toBe(200);
+    expect(w.authCalls.filter((c) => c === 'token').length).toBe(before);
+  });
+
   test('a refresh token must be the caller’s own', async () => {
     const res = await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('bob@example.com'), lang: 'en', timeZone: 'Europe/Amsterdam' });
     expect(res.status).toBe(400);
