@@ -417,9 +417,16 @@ rotate, revoke) and the minute ticks. Warm means the isolate had served a reques
 | Cron tick, nobody due | 3 to 4 D1 | 2 to 6 |
 | Check, one feed-only person | batchGet, 2 to 4 aggregations, a token, 2 D1 | 7 to 8 |
 | Feed build (its own invocation; queue or `SELF.work`), 1 to 3 events | lease, batchGet, 4 queries, 2 D1 | 10 to 18 |
+| Production: check of one person with Google (63 events), every 5 minutes, 9:00 to 9:30 UTC | Google token, change list, batchGet, 2 to 4 aggregations, 1 to 2 D1 | 2 to 15, typically 5 |
+| Production: sync round, 63 events, fresh queue isolate (before #30 and #34) | ~16 | 34 to 83 |
+| Production: the next round in the same isolate (before #30 and #34) | ~16 | 36 |
 
-Locally (workerd under the DevTools profiler), the export itself, 50 events
-in a warm isolate, is about 2 ms: the time is in the subrequests, not the calendar's size.
+Locally (workerd under the DevTools profiler), the export itself, 50 events in a warm isolate, is
+about 2 ms, and a 63-event sync round's own work (decode, export, plan) 3 to 5 ms warm against 18 ms
+in a fresh isolate. The rest is subrequests, about 1 ms each, and first use of code in a fresh
+isolate, which `src/warm.ts` moves to startup (38 ms of startup, of the 1 second allowed).
+Since #30 a round makes 4 Firestore requests fewer; the production sync figures above are from
+before it and #34.
 
 ## One-time setup
 
