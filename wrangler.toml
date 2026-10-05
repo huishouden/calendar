@@ -41,6 +41,16 @@ max_batch_size = 1
 max_batch_timeout = 1
 max_retries = 3
 
+# Extra roots for the minute's checks when there are more people than the cron's 31 invocations
+# take (src/ticker.ts). SQLite-backed: the only kind on the free plan.
+[[durable_objects.bindings]]
+name = "TICKER"
+class_name = "Ticker"
+
+[[migrations]]
+tag = "v1-ticker"
+new_sqlite_classes = ["Ticker"]
+
 # This Worker's own Fanout entrypoint: each check and each unit of work is its own invocation.
 [[services]]
 binding = "SELF"
@@ -83,6 +93,14 @@ queue = "huishouden-calendar-work-staging"
 max_batch_size = 1
 max_batch_timeout = 1
 max_retries = 3
+
+[[env.staging.durable_objects.bindings]]
+name = "TICKER"
+class_name = "Ticker"
+
+[[env.staging.migrations]]
+tag = "v1-ticker"
+new_sqlite_classes = ["Ticker"]
 
 [[env.staging.services]]
 binding = "SELF"
