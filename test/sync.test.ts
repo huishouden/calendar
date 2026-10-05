@@ -60,6 +60,17 @@ describe('connecting', () => {
     expect(w.google.live(calendarId).map((e) => e.summary).sort()).toEqual(['Checkup', 'Garbage pickup', 'Medicine for Nan', 'Power bill', 'To do: Buy paint']);
   });
 
+  test('Continue in this tab: the code is exchanged with the page Google sent it to, only a listed one', async () => {
+    const odd = await call('/api/google/connect', 'alice@example.com', { household, code: 'good-code', redirectUri: 'https://evil.example/my-calendar', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
+    expect(odd.status).toBe(400);
+    expect(((await odd.json()) as { error: string }).error).toBe('redirect-uri');
+    expect(w.google.redirects).toEqual([]);
+    const res = await call('/api/google/connect', 'alice@example.com', { household, code: 'good-code', redirectUri: 'https://site.example/my-calendar', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
+    expect(res.status).toBe(200);
+    await call('/api/google/connect', 'alice@example.com', { household, code: 'good-code', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
+    expect(w.google.redirects).toEqual(['https://site.example/my-calendar', 'postmessage']);
+  });
+
   test('a failed connect says why in the log (Google’s error name), with nothing personal', async () => {
     const logs = captureLogs();
     const res = await call('/api/google/connect', 'alice@example.com', { household, code: 'bad-code', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });

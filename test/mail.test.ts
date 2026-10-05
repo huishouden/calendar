@@ -105,6 +105,14 @@ describe('connecting an alert inbox', () => {
     expect(await listDocs(`${H}/spendingInboxes`)).toEqual([]);
   });
 
+  test('Continue in this tab: Spending’s page is a return address; another is refused', async () => {
+    const odd = await call('/api/mail/connect', 'alice@example.com', { household, code: 'gmail-alerts', redirectUri: 'https://site.example/other/', refreshToken: refreshFor('alice@example.com'), timeZone: TZ });
+    expect(odd.status).toBe(400);
+    const res = await call('/api/mail/connect', 'alice@example.com', { household, code: 'gmail-alerts', redirectUri: 'https://site.example/spending/', refreshToken: refreshFor('alice@example.com'), timeZone: TZ });
+    expect(res.status).toBe(200);
+    expect(w.google.redirects).toEqual(['https://site.example/spending/']);
+  });
+
   test('Gmail left unticked in Google’s window is refused, and nothing is kept', async () => {
     const res = await call('/api/mail/connect', 'bob@example.com', { household, code: 'gmail-denied', refreshToken: refreshFor('bob@example.com'), timeZone: TZ });
     expect(res.status).toBe(400);

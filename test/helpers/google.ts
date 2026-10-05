@@ -25,6 +25,8 @@ export class FakeGoogle {
   seq = 0;
   calendars = new Map<string, Cal>();
   revoked = new Set<string>();
+  /** The redirect_uri of each code exchange: `postmessage` for the popup, the page for "Continue in this tab". */
+  redirects: string[] = [];
   /** Every request, method and path (batches counted once, and their parts listed). */
   calls: string[] = [];
   account = 'alice@example.com';
@@ -111,6 +113,7 @@ export class FakeGoogle {
     const p = new URLSearchParams(body);
     if (p.get('grant_type') === 'authorization_code') {
       const code = p.get('code');
+      this.redirects.push(p.get('redirect_uri') ?? '');
       if (code === 'bad-code') return json(400, { error: 'invalid_grant' });
       // Codes "gmail-<name>" are an alert inbox's account (test/helpers/gmail.ts); "gmail-denied" has Gmail unticked.
       const gmail = code?.startsWith('gmail-');

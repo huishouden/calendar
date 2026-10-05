@@ -6,7 +6,7 @@ import type { Env, Fetch } from '../env';
 import { log } from '../log';
 import { authOptions } from '../person';
 import { householdKey } from '../store';
-import { exchangeCode, GMAIL_SCOPE, GoogleAuthError, revokeGoogle } from '../google/oauth';
+import { exchangeCode, GMAIL_SCOPE, GoogleAuthError, redirectUriFor, revokeGoogle } from '../google/oauth';
 import { Gmail, GmailApiError } from './gmail';
 import { actingAs, inboxDoc } from './inbox';
 import { MAIL_EVERY_MIN } from './check';
@@ -131,6 +131,8 @@ export async function connectInbox(env: Env, who: MailCaller, b: Record<string, 
   const now = deps.now ?? Date.now();
   if (typeof b.code !== 'string' || !b.code || b.code.length > 2048) throw new MailHttpError(400, 'code');
   if (typeof b.refreshToken !== 'string' || b.refreshToken.length < 20 || b.refreshToken.length > 4096) throw new MailHttpError(400, 'refresh-token');
+  const redirectUri = redirectUriFor(env, b.redirectUri);
+  if (!redirectUri) throw new MailHttpError(400, 'redirect-uri');
   let checked;
   try {
     checked = await exchangeRefreshToken(authOptions(env, deps.fetch), b.refreshToken);
@@ -142,7 +144,7 @@ export async function connectInbox(env: Env, who: MailCaller, b: Record<string, 
 
   let granted;
   try {
-    granted = await exchangeCode(env, b.code, deps.fetch, now, GMAIL_SCOPE);
+    granted = await exchangeCode(env, b.code, deps.fetch, now, GMAIL_SCOPE, redirectUri);
   } catch (e) {
     if (e instanceof GoogleAuthError) throw new MailHttpError(e.kind === 'config' ? 501 : e.kind === 'unavailable' ? 503 : 400, `google-${e.kind}`, e.message.slice(0, 80));
     throw e;
