@@ -515,7 +515,7 @@ account's workers.dev subdomain.
 ```sh
 bun install
 bun run lint
-bun run test:emulator   # the Firestore emulator with huishouden/rules' rules (a checkout next to this one, or RULES_PATH)
+bun run test            # in the Firestore emulator with huishouden/rules' rules (a checkout next to this one, or RULES_PATH)
 ```
 
 The tests use the real household rules in the Firestore emulator. Google (OAuth, Calendar API,
