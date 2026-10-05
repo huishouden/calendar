@@ -10,6 +10,8 @@ import { runMailWork } from './mail/work';
 import { runWork, type WorkMessage, type WorkOutcome } from './work';
 import { warm } from './warm';
 
+export { Ticker } from './ticker';
+
 warm();
 
 /**

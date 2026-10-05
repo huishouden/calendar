@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
 import { syncPerson, MAX_WRITES } from '../src/sync';
-import { runCron, pack, periodsFor, slotsFor, GOOGLE_EVERY_MIN, FEED_EVERY_MIN, MAX_CALLS, READS_PER_CHECK } from '../src/tick';
+import { runCron, runPart, nextAlarm, pack, periodsFor, CHUNK, CAPACITY, slotsFor, GOOGLE_EVERY_MIN, FEED_EVERY_MIN, MAX_CALLS, READS_PER_CHECK } from '../src/tick';
 import { runWork, SYNC, FEED, markWork } from '../src/work';
 import { checkPeople } from '../src/check';
 import { personId, loadPerson } from '../src/store';
@@ -233,6 +233,36 @@ describe('fan-out and the queue', () => {
     expect(chunks.some((c) => ['d', 'e', 'f'].every((p) => c.includes(p)))).toBe(true);
   });
 
+  test('more chunks than the cron’s 30 invocations: Tickers take the other parts; together they check everyone once', async () => {
+    const shard = 7;
+    for (let i = 0; i < 70; i++) await w.env.DB.prepare('INSERT INTO people (pid, created_at, shard, google, hh) VALUES (?, 0, ?, 1, ?)').bind(`fake${String(i).padStart(2, '0')}`, shard, `hh${i}`).run();
+    const armed: number[] = [];
+    w.env.TICKER = { idFromName: (n: string) => n, get: () => ({ arm: async (k: number) => void armed.push(k) }) } as never;
+    const checked: string[] = [];
+    const self = w.env.SELF!;
+    w.env.SELF = { ...self, check: async (pids) => (checked.push(...pids), self.check(pids)) };
+    const at = Math.floor(w.clock.now / 3_600_000) * 3_600_000 + 3_600_000 + shard * MIN;
+    const cron = await runCron(w.env, { fetch: w.fetch, now: at });
+    expect(cron.parts).toBe(2);
+    expect(armed).toEqual([1]);
+    expect(cron.calls).toBeLessThanOrEqual(MAX_CALLS);
+    const ticker = await runPart(w.env, { fetch: w.fetch, now: at + 5_000, part: 1 });
+    expect(ticker.calls).toBeLessThanOrEqual(MAX_CALLS);
+    expect(checked.sort()).toEqual(Array.from({ length: 70 }, (_, i) => `fake${String(i).padStart(2, '0')}`));
+    // A minute that needs one part: Ticker 1 is told to stop.
+    await w.env.DB.prepare("DELETE FROM people WHERE pid LIKE 'fake%'").run();
+    await runCron(w.env, { fetch: w.fetch, now: at + 60_000 });
+    expect((await runPart(w.env, { fetch: w.fetch, now: at + 65_000, part: 1 })).stop).toBe(1);
+    expect(nextAlarm(at + 5_000)).toBe(at + 65_000);
+  });
+
+  test('more people than the minute’s capacity: checks space out rather than overflow', () => {
+    const p = periodsFor(5000, 0);
+    expect((1.25 * 5000) / p.google).toBeLessThanOrEqual(CAPACITY);
+    expect(p.google).toBeGreaterThan(GOOGLE_EVERY_MIN);
+    expect(periodsFor(1000, 0)).toEqual({ google: 5, feed: 15 });
+  });
+
   test('a Firestore read budget: the checks slow down rather than go over it', () => {
     expect(periodsFor(1000, 1000)).toEqual({ google: 5, feed: 15 });
     // 20 people with Google and 20 with a feed: every 5 minutes would be 38,400 reads a day.
@@ -385,7 +415,7 @@ describe('fan-out and the queue', () => {
     const totals = await runCron(w.env, { fetch: w.fetch, now: at });
     expect(totals.due).toBe(41);
     expect(totals.calls).toBeLessThanOrEqual(MAX_CALLS);
-    expect(totals.calls).toBeGreaterThanOrEqual(Math.ceil(41 / 8));
+    expect(totals.calls).toBeGreaterThanOrEqual(Math.ceil(41 / CHUNK));
     expect(totals.deferred).toBe(0);
     const status = (await (await call(`/api/status?household=${household}`, 'alice@example.com')).json()) as { google: { lastOk: number } };
     expect(status.google.lastOk).toBe(at);
