@@ -2,6 +2,7 @@ import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import ICAL from 'ical.js';
 import { icsProblems } from '@huishouden/pwa-kit/ics';
 import { handleApi } from '../src/api';
+import { personId } from '../src/store';
 import { serveFeed, FEED_PATH } from '../src/feed';
 import { captureLogs } from '../src/log';
 import { apiRequest, drain, household, refreshFor, readDoc, refresh, resetFirestore, seed, world, writeDoc, type World } from './helpers/world';
@@ -246,6 +247,21 @@ describe('the feed', () => {
     await refresh(w);
     expect((await get(secret)).status).toBe(404);
     expect((await get(secret)).status).toBe(404);
+  });
+
+  test('signed out everywhere (the refresh token is dead): the check marks it, not a Firestore error', async () => {
+    const secret = await setUpFeed('bob@example.com');
+    const pid = await personId(household, 'bob@example.com');
+    const { loadPerson, savePerson } = await import('../src/store');
+    await savePerson(w.env, pid, { ...(await loadPerson(w.env, pid))!, refreshToken: 'rt:revoked-bob#refresh-token' });
+    const { forgetTokens } = await import('../src/person');
+    forgetTokens();
+    const { checkPeople } = await import('../src/check');
+    const totals = await checkPeople(w.env, [pid], { fetch: w.fetch, now: w.clock.now });
+    expect(totals.errors).toBe(0);
+    expect((await loadPerson(w.env, pid))!.signedOut).toBe(true);
+    // The stored feed stands.
+    expect((await get(secret)).status).toBe(200);
   });
 
   test('a made-up secret is a 404; the KV holds nothing readable', async () => {
