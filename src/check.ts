@@ -1,3 +1,5 @@
+import { FirestoreError } from '@huishouden/pwa-kit/firestore-rest';
+import { FirebaseAuthError } from '@huishouden/pwa-kit/firebase-auth-rest';
 import type { Env, Fetch } from './env';
 import { log } from './log';
 import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
@@ -89,6 +91,8 @@ export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}
         break;
       }
       totals.errors++;
+      // The kind only (no person, no message text that could carry one).
+      log('check', { error: e instanceof FirestoreError ? `firestore-${e.code}` : e instanceof CalendarApiError ? `google-${e.status}` : e instanceof GoogleAuthError ? `google-${e.kind}` : e instanceof FirebaseAuthError ? `firebase-${e.kind}` : e instanceof Error ? e.name : 'unknown' });
       if (isRateLimited(e)) {
         const n = row.backoff + 1;
         await env.DB.prepare('UPDATE people SET backoff = ?, backoff_until = ? WHERE pid = ?').bind(n, now + Math.min(3600, 30 * 2 ** (n - 1)) * 1000, row.pid).run();
