@@ -4,4 +4,4 @@
 
 ### Features
 
-* A Health appointment in the feed and Google Calendar reads "Appointment for Ana" unless the reader turns on Health details (pwa-kit 0.97.0).
+* A Health appointment in the feed and Google Calendar reads "Appointment for Ana" unless the reader turns on Health details, which add its kind, doctor, place and what to bring; its notes never leave the app (pwa-kit 0.101.0).
