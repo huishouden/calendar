@@ -33,6 +33,34 @@ export interface CheckDeps {
   fetch?: Fetch;
   now?: number;
   firestoreUrl?: string;
+  /**
+   * The cron's checks pass the minutes between a Google person's checks: their household side is
+   * then read every `QUIET_EVERY_MIN` while it is quiet (`householdDue`). Without it (a feed fetch,
+   * the portal) every check reads it.
+   */
+  googleEvery?: number;
+}
+
+/** A household whose signal changed within this long is checked at every Google check (5 minutes). */
+export const ACTIVE_MS = 60 * 60_000;
+/** Otherwise its household side is read at most every this many minutes; Google's side still every check. */
+export const QUIET_EVERY_MIN = 15;
+
+/**
+ * Whether this check reads the person's household side (their view and the four aggregations, about
+ * 6 billed reads). Google's side costs no Firestore reads and is checked every time. A household
+ * that changed in the last hour is read at every check; a quiet one at the first check of each
+ * quarter hour of the person's slot (`shard`), so a first change after a quiet spell reaches Google
+ * within 15 minutes and the ones after it within 5. With checks 15 or more minutes apart (the read
+ * budget's), every check reads it.
+ */
+export function householdDue(row: Pick<PersonRow, 'shard' | 'hh_signal' | 'hh_signal_at'>, now: number, googleEvery: number | undefined): boolean {
+  if (!googleEvery || googleEvery >= QUIET_EVERY_MIN) return true;
+  if (!row.hh_signal) return true;
+  if (row.hh_signal_at && now - row.hh_signal_at < ACTIVE_MS) return true;
+  const quarter = QUIET_EVERY_MIN * 60_000;
+  const offset = row.shard * 60_000;
+  return Math.floor((now - offset) / quarter) !== Math.floor((now - googleEvery * 60_000 - offset) / quarter);
 }
 
 export interface CheckTotals {
@@ -45,11 +73,13 @@ export interface CheckTotals {
   /** People left for another invocation: this one's subrequests ran out. */
   deferred: string[];
   paused: boolean;
+  /** Google people whose household side wasn't due this time (quiet: see `householdDue`). */
+  quiet: number;
 }
 
 export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}): Promise<CheckTotals> {
   const now = deps.now ?? Date.now();
-  const totals: CheckTotals = { checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, deferred: [], paused: false };
+  const totals: CheckTotals = { checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, deferred: [], paused: false, quiet: 0 };
   if (pids.length === 0) return totals;
   let calls = 0;
   const base = deps.fetch ?? ((url: string, init?: RequestInit) => fetch(url, init));
@@ -144,7 +174,13 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
     }
   }
 
-  // The household's side.
+  // The household's side: only when due (`householdDue`); the reasons a sync or feed is due anyway still count.
+  if (google && !householdDue(row, now, deps.googleEvery)) {
+    totals.quiet++;
+    if (!row.full_at || now - row.full_at > FULL_EVERY_MS) kinds |= SYNC;
+    if (record.feed && row.feed === 1 && row.feed_stale) kinds |= FEED;
+    return kinds;
+  }
   const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
   let signal: string;
   try {
@@ -162,6 +198,10 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
       return 0;
     }
     throw e;
+  }
+  if (signal !== row.hh_signal) {
+    // Seen changing (not the first time it is seen): the household counts as active for an hour.
+    await env.DB.prepare('UPDATE people SET hh_signal = ?, hh_signal_at = ? WHERE pid = ?').bind(signal, row.hh_signal ? now : 0, row.pid).run();
   }
   if (google && (signal !== row.signal || !row.full_at || now - row.full_at > FULL_EVERY_MS)) kinds |= SYNC;
   if (record.feed && row.feed === 1) {

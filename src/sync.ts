@@ -156,7 +156,7 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
   // The household's home zone when it has one, so "9:00" is 9:00 at home wherever the phone is.
   const tz = zoneOf(view, record);
   // The agenda is read in any case (a round runs only when a check saw a change); the signal comes from it.
-  let loaded = await person.load(view);
+  let loaded = await person.load(view, now);
   const signal = person.signalOf(view, loaded, signalExtra(view, record));
   const full = !row.full_at || now - row.full_at > FULL_EVERY_MS || rows.length === 0;
   if (signal === row.signal && real.length === 0 && !full) {
@@ -204,7 +204,7 @@ export async function syncPerson(env: Env, pid: string, deps: SyncDeps = {}): Pr
         const outcome = await applyEdit(edit, { person, view, today: clock.today(), now, timeZone: tz, items });
         if (outcome === 'applied' || outcome === 'already') {
           counts.applied++;
-          loaded = await person.load(view);
+          loaded = await person.load(view, now);
         } else if (outcome === 'conflict') {
           counts.conflicts++;
           forced.add(r.key);
