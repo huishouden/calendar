@@ -54,10 +54,18 @@ jobs:
       - name: Bundle (wrangler dry run)
         run: bunx wrangler deploy --dry-run --outdir dist
 
+  # Tags the next version from the Conventional Commit titles and creates the release (pwa-kit STANDARD.md "Versions"); nothing is committed.
+  release:
+    needs: [leak-scan, build]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    uses: huishouden/pwa-kit/.github/workflows/tag-release.yml@03987ceeb01eb81e3a03b854d0775e29279017d8 # v0.114.0
+    permissions:
+      contents: write
+
   # Deploys on main once the `production` environment has a CLOUDFLARE_API_TOKEN secret (README, "Deploy"); skipped
   # until then. Staging first, then production. Worker secrets stay in Cloudflare.
   deploy:
-    needs: [leak-scan, build]
+    needs: [leak-scan, build, release]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # The Cloudflare token is a secret of the `production` environment, whose deployment branches
