@@ -16,6 +16,9 @@ It also checks **Spending's alert inboxes**: Gmail accounts a member connected i
 minutes, with no app open ("Spending's alert inboxes" below).
 
 What a person sees is what they may see in the household, in their language, with their settings.
+Their language is the one they set in the apps (`households/{id}.langs`, read with the household),
+else the one their device had when they set the calendar up; each item's `texts` in it, else the
+item's own words (apps store `texts` only for their readers' languages other than the writer's).
 Helpers and kids get nothing private and no bills. Health items go only to the person, their carers
 and the admins, and by default read "Medicine for Ana" or "Appointment for Ana" with no detail, because calendars are often
 shared. With Health details turned on in the person's calendar settings, an appointment's description

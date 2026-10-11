@@ -163,6 +163,24 @@ describe('a busy household, in units', () => {
     expect((await w.env.DB.prepare('SELECT COUNT(*) AS n FROM people WHERE round IS NOT NULL').first<{ n: number }>())!.n).toBe(0);
   });
 
+  test("the feed is in the language the person set in the apps, not the one from setting up", async () => {
+    await busy({ series: 2, singles: 20, todos: 4 });
+    const home = (await readDoc(`households/${household}`))!;
+    await seed({ [`households/${household}`]: { ...home, langs: { 'alice@example.com': 'nl' } } });
+    await call('/api/feed', 'alice@example.com', { household, refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });
+    await drain(w);
+    const pid = await personId(household, 'alice@example.com');
+    const record = (await loadPerson(w.env, pid))!;
+    expect(record.lang).toBe('en');
+    const { view, loaded } = await loadAs('alice@example.com');
+    await loadExportLang('nl');
+    const whole = exportEvents({ agenda: loaded.agenda, todos: loaded.todos, me: 'alice@example.com', role: view.role, lang: 'nl', timeZone: TZ, settings: view.settings });
+    const row = (await w.env.DB.prepare('SELECT body FROM feeds WHERE pid = ?').bind(pid).first<{ body: string }>())!;
+    const body = await openFeedBody(w.env, record.feed!.secret, row.body);
+    expect(body).toBe(exportIcs(whole, { householdId: household, timeZone: TZ, lang: 'nl', now: w.clock.now }));
+    expect(body).not.toBe(exportIcs(exportEvents({ agenda: loaded.agenda, todos: loaded.todos, me: 'alice@example.com', role: view.role, lang: 'en', timeZone: TZ, settings: view.settings }), { householdId: household, timeZone: TZ, lang: 'en', now: w.clock.now }));
+  });
+
   test('items gone from the household go from Google, deletions first, in units of MAX_WRITES', async () => {
     await busy({ series: 0, singles: 30, todos: 0 });
     await call('/api/google/connect', 'alice@example.com', { household, code: 'good-code', refreshToken: refreshFor('alice@example.com'), lang: 'en', timeZone: TZ });

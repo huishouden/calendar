@@ -7,7 +7,7 @@ import type { Doc } from '@huishouden/pwa-kit/firestore-rest';
 import { LocalClock } from '@huishouden/pwa-kit/local-clock';
 import { globalFetch, type Env, type Fetch } from './env';
 import { log } from './log';
-import { loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type View } from './person';
+import { langOf, loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type View } from './person';
 import { readLists, type Tally } from './lists';
 import { seal, unseal } from './seal';
 import { accessToken, GoogleAuthError } from './google/oauth';
@@ -474,7 +474,7 @@ async function loadLists(ctx: Ctx, keptOnly = false) {
 
 const exportInput = (ctx: Ctx): Omit<ExportInput, 'agenda' | 'todos'> => {
   const view = ctx.state.view!;
-  return { me: ctx.record.email, role: view.role, lang: ctx.record.lang, timeZone: zoneOf(view, ctx.record), settings: view.settings, home: view.home?.address };
+  return { me: ctx.record.email, role: view.role, lang: langOf(view, ctx.record), timeZone: zoneOf(view, ctx.record), settings: view.settings, home: view.home?.address };
 };
 
 // ---- split: the signal, Google's changes carried back, the parts ----
@@ -499,7 +499,7 @@ async function splitStep(ctx: Ctx): Promise<Next> {
     }
   }
   if (isSync(ctx)) state.counts.full = true;
-  await loadExportLang(record.lang);
+  await loadExportLang(langOf(ctx.state.view!, record));
   if (isSync(ctx) && (state.pending || state.editAt < state.real.length)) {
     // Google's changes carried back (an edit at most); then the lists again, as they are now.
     await carryBack(ctx, loaded);
@@ -537,7 +537,7 @@ async function carryBack(ctx: Ctx, loaded: Omit<Loaded, 'reads'>): Promise<void>
   const { results } = await env.DB.prepare('SELECT * FROM events WHERE pid = ?').bind(pid).all<EventRow>();
   const byId = new Map(results.map((r) => [r.event_id, r]));
   const events = exportEvents({ ...exportInput(ctx), agenda: loaded.agenda, todos: loaded.todos });
-  const format = dateFormatter(record.lang, tz);
+  const format = dateFormatter(langOf(ctx.state.view!, record), tz);
   const clock = new LocalClock(tz, () => now);
   const forced = new Set(state.forced);
   const hide = new Set(state.hide);
@@ -614,13 +614,13 @@ async function exportStep(ctx: Ctx): Promise<Next> {
     part = (await opened<{ agenda: AgendaItem[]; todos: TodoItem[] }>(ctx, (await handedOn(ctx, 'in'))[at])) ?? undefined;
     if (!part) return restart(ctx);
   }
-  await loadExportLang(record.lang);
+  await loadExportLang(langOf(ctx.state.view!, record));
   const events = exportEvents({ ...exportInput(ctx), agenda: part.agenda, todos: part.todos });
   state.events += events.length;
   if (buildsFeed(ctx)) {
-    const options = { householdId: record.household, timeZone: tz, lang: record.lang, now: state.started };
+    const options = { householdId: record.household, timeZone: tz, lang: langOf(ctx.state.view!, record), now: state.started };
     const pieces = events.map((e) => ({ s: e.start, k: e.key, t: eventIcs(e, options) }));
-    state.witness = keepWitness(state.witness, events, record.household, tz, record.lang);
+    state.witness = keepWitness(state.witness, events, record.household, tz, langOf(ctx.state.view!, record));
     // One part: the feed is put together in this unit. Several: in a unit of its own.
     if (state.chunks === 1) ctx.memo.pieces = pieces;
     else await handOn(ctx, 'ics', pieces);
@@ -709,7 +709,7 @@ async function feedStep(ctx: Ctx): Promise<Next> {
     }
     // A part went missing: start again rather than serve a calendar without it.
     if (pieces.length !== state.events) return restart(ctx);
-    const body = assembleIcs(pieces, state.witness, { householdId: record.household, timeZone: tz, lang: record.lang, now: state.started });
+    const body = assembleIcs(pieces, state.witness, { householdId: record.household, timeZone: tz, lang: langOf(ctx.state.view!, record), now: state.started });
     ctx.statements.push(...(await feedStatements(env, pid, record.feed.secret, { signal: state.signal!, etag: `"${contentHash(body)}"`, body, now: ctx.now })));
     log('feed', { built: true, events: state.events, problems: icsProblems(body).length, lists: Object.entries(state.reads).map(([c, o]) => `${c}:${o}`).join(' ') });
   }

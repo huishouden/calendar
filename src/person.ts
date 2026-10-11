@@ -5,6 +5,7 @@ import { PERSONAL_TODOS, toTodoItem, type TodoItem } from '@huishouden/pwa-kit/t
 import { isRestricted, ROLES, type Role } from '@huishouden/pwa-kit/role-core';
 import { CALENDAR_SETTINGS, toCalendarSettings, contentHash, type CalendarSettings } from '@huishouden/pwa-kit/calendar-export';
 import { householdTimeZone, toHome, type HouseholdHome } from '@huishouden/pwa-kit/home';
+import { isLang, type Lang } from '@huishouden/pwa-kit/i18n';
 import type { Env, Fetch } from './env';
 import type { PersonRecord } from './store';
 import { listKey, readList, tallyOf, type ListOutcome, type ListReads, type Tally } from './lists';
@@ -49,7 +50,15 @@ export interface View {
   settingsAt: number;
   /** The household's home (`households/{id}.home`), read with the household: its address and zone. */
   home?: HouseholdHome;
+  /** The person's language as they set it in the apps (`households/{id}.langs`), read with the household. */
+  lang?: Lang;
 }
+
+/**
+ * The language the person's calendar is in: theirs as set in the apps, else the one their device had
+ * when they set the calendar up.
+ */
+export const langOf = (view: Pick<View, 'lang'>, record: Pick<PersonRecord, 'lang'>): Lang => view.lang ?? record.lang;
 
 /**
  * The zone the person's calendar keeps: the household's home zone when it has one, else the zone
@@ -62,8 +71,8 @@ export const zoneOf = (view: Pick<View, 'home'>, record: Pick<PersonRecord, 'tim
  * (the LOCATION of things at home). Without a home it is what it was before homes, so setting none
  * rebuilds nothing.
  */
-export const signalExtra = (view: Pick<View, 'home'>, record: Pick<PersonRecord, 'lang' | 'timeZone'>): string =>
-  `${record.lang}|${zoneOf(view, record)}${view.home ? `|${view.home.address}` : ''}`;
+export const signalExtra = (view: Pick<View, 'home' | 'lang'>, record: Pick<PersonRecord, 'lang' | 'timeZone'>): string =>
+  `${langOf(view, record)}|${zoneOf(view, record)}${view.home ? `|${view.home.address}` : ''}`;
 
 export interface Loaded {
   agenda: AgendaItem[];
@@ -162,6 +171,8 @@ export class Person {
     const role = roleOf(household, email);
     const stored = settings ? { data: settings } : null;
     const home = toHome(household.home);
+    const langs = household.langs && typeof household.langs === 'object' ? (household.langs as Record<string, unknown>) : {};
+    const lang = isLang(langs[email]) ? (langs[email] as Lang) : undefined;
     return {
       household: this.record.household,
       email,
@@ -170,6 +181,7 @@ export class Person {
       settings: toCalendarSettings(stored?.data),
       settingsAt: typeof stored?.data.updatedAt === 'number' ? stored.data.updatedAt : 0,
       ...(home ? { home } : {}),
+      ...(lang ? { lang } : {}),
     };
   }
 

@@ -3,7 +3,7 @@ import { handleApi } from '../src/api';
 import { checkPeople, dueAnyway, householdDue, ACTIVE_MS, QUIET_EVERY_MIN } from '../src/check';
 import { FULL_EVERY_MS } from '../src/sync';
 import { FEED, SYNC } from '../src/work';
-import { Person } from '../src/person';
+import { langOf, Person, signalExtra } from '../src/person';
 import { LIST_MAX_AGE_MS } from '../src/lists';
 import { loadPerson, personId } from '../src/store';
 import { apiRequest, deleteDoc, drain, household, readDoc, refreshFor, resetFirestore, seed, world, writeDoc, TZ, type World } from './helpers/world';
@@ -30,6 +30,22 @@ async function load(email: string, now = w.clock.now) {
   return { loaded, how: loaded.reads as Record<string, string>, p, view };
 }
 const agendaPath = `households/${household}/agenda/baby_appointment_a1`;
+
+describe("the person's language", () => {
+  test('is theirs as set in the apps, read with the household, else the one from setting up', async () => {
+    const before = await load('alice@example.com');
+    expect(before.view.lang).toBeUndefined();
+    expect(langOf(before.view, { lang: 'es' })).toBe('es');
+    const home = (await readDoc(`households/${household}`))!;
+    await writeDoc(`households/${household}`, { ...home, langs: { 'alice@example.com': 'nl', 'bob@example.com': 'fr' } });
+    const after = await load('alice@example.com');
+    expect(after.view.lang).toBe('nl');
+    expect(langOf(after.view, { lang: 'es' })).toBe('nl');
+    // A change of language changes the calendar's signal, so it is rebuilt in it.
+    expect(signalExtra(after.view, { lang: 'es', timeZone: TZ })).not.toBe(signalExtra(before.view, { lang: 'es', timeZone: TZ }));
+    expect((await load('bob@example.com')).view.lang).toBeUndefined();
+  });
+});
 
 describe('lists kept between loads', () => {
   test('unchanged: the kept copy, the same as reading everything', async () => {
