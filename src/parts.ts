@@ -1,4 +1,4 @@
-import { exportIcs, toIcsEvents, visibleTo, type ExportEvent, type ExportInput } from '@huishouden/pwa-kit/calendar-export';
+import { exportClusters, exportIcs, toIcsEvents, visibleTo, type ExportEvent, type ExportInput } from '@huishouden/pwa-kit/calendar-export';
 import { CRLF, foldLine, veventLines } from '@huishouden/pwa-kit/ics';
 import type { AgendaItem } from '@huishouden/pwa-kit/agenda-core';
 import type { TodoItem } from '@huishouden/pwa-kit/todo-core';
@@ -22,22 +22,17 @@ export interface Piece {
 
 /**
  * The lists cut into parts for the export, each at most `size` items (an app record's items stay
- * together: a series is one event), without what the person doesn't see, as even as that allows.
- * Exporting each part and sorting the events together gives exactly `exportEvents` of the whole.
+ * together: a series is one event; so do records whose items merge, `exportClusters`), without what
+ * the person doesn't see, as even as that allows. Exporting each part and sorting the events
+ * together gives exactly `exportEvents` of the whole.
  */
 export function partition(loaded: Pick<Loaded, 'agenda' | 'todos'>, input: Pick<ExportInput, 'me' | 'role' | 'settings'>, size = UNIT_ITEMS): { agenda: AgendaItem[]; todos: TodoItem[] }[] {
-  const groups = new Map<string, AgendaItem[]>();
-  for (const item of loaded.agenda) {
-    if (!visibleTo(item, input)) continue;
-    const k = `${item.app}|${item.ref}`;
-    const g = groups.get(k);
-    if (g) g.push(item);
-    else groups.set(k, [item]);
-  }
+  const groups = exportClusters(loaded.agenda, input);
+  const records = new Set(groups.flat().map((i) => `${i.app}|${i.ref}`));
   const todos = input.settings.todos
-    ? (loaded.todos ?? []).filter((t) => t.status === 'open' && t.due !== undefined && !groups.has(`${t.app}|${t.ref}`) && visibleTo({ app: t.app, kind: 'task', private: t.private, audience: t.audience }, input))
+    ? (loaded.todos ?? []).filter((t) => t.status === 'open' && t.due !== undefined && !records.has(`${t.app}|${t.ref}`) && visibleTo({ app: t.app, kind: 'task', private: t.private, audience: t.audience }, input))
     : [];
-  const total = [...groups.values()].reduce((n, g) => n + g.length, 0) + todos.length;
+  const total = groups.reduce((n, g) => n + g.length, 0) + todos.length;
   // As even as the size allows: 63 items go as 32 and 31, not 50 and 13.
   const even = Math.ceil(total / Math.max(1, Math.ceil(total / size)));
   const parts: { agenda: AgendaItem[]; todos: TodoItem[] }[] = [];
@@ -49,7 +44,7 @@ export function partition(loaded: Pick<Loaded, 'agenda' | 'todos'>, input: Pick<
       current = { agenda: [], todos: [] };
     }
   };
-  for (const items of groups.values()) {
+  for (const items of groups) {
     add(items.length);
     current.agenda.push(...items);
   }

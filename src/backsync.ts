@@ -113,6 +113,41 @@ function sameWhen(a: { at: number; allDay: boolean } | null, allDay: boolean, st
  * this is someone's change, not our own write coming back.
  */
 export function readChange(g: GoogleEvent, written: Written | undefined, event: ExportEvent | undefined, timeZone: string, formatter: (t: number, allDay: boolean) => string): Reading {
+  const reading = readOne(g, written, event, timeZone, formatter);
+  if (!event?.merged || !('edits' in reading)) return reading;
+  return mergedEdits(reading.edits, event);
+}
+
+/** Edits that can be said for several records at once: a move, a skip, a cancel, a hide. */
+const FOR_EACH: readonly EditKind[] = ['reschedule', 'skip', 'cancel', 'hide'];
+
+/**
+ * A change to an event standing for several records (`merged`, `@huishouden/pwa-kit/merge`): the
+ * same edit once for each record, through that record's own item. For one occurrence of a merged
+ * series, the records that have an item on that day (on a day only some of them happen, only
+ * those); a day past what the apps published has none, so every record of the series, through its
+ * first item (the edit's ops name the day with `'$original'`). A new title or notes, or a series' new
+ * time, can't be said for several records: put back.
+ */
+export function mergedEdits(edits: Edit[], event: ExportEvent): Reading {
+  if (edits.some((e) => !FOR_EACH.includes(e.kind))) return { revert: true };
+  const records = new Map<string, AgendaItem[]>();
+  for (const i of event.items) records.set(`${i.app}|${i.ref}`, [...(records.get(`${i.app}|${i.ref}`) ?? []), i]);
+  const out: Edit[] = [];
+  for (const e of edits) {
+    if (e.kind === 'hide') {
+      out.push(e);
+      continue;
+    }
+    const original = e.values.original;
+    const onDay = original ? [...records.values()].map((items) => items.find((i) => i.series?.original === original)).filter((i): i is AgendaItem => !!i) : [];
+    const items = onDay.length ? onDay : [...records.values()].map((items) => items[0]);
+    for (const item of items) out.push({ ...e, item });
+  }
+  return out.length ? { edits: out } : { revert: true };
+}
+
+function readOne(g: GoogleEvent, written: Written | undefined, event: ExportEvent | undefined, timeZone: string, formatter: (t: number, allDay: boolean) => string): Reading {
   if (!event || !written) return { ignore: true };
   const at = g.updated ? Date.parse(g.updated) : Date.now();
   const series = written.series;
@@ -273,7 +308,8 @@ function agendaChange(edit: Edit, ctx: ApplyContext): { writes: Op[]; undo: Op[]
       undo.push({ col: listOf(occurrence), id: occurrence.id, data: stored(occurrence) });
     }
   } else if (kind === 'cancel') {
-    for (const i of edit.event.items) {
+    // A merged event is cancelled record by record: each edit removes its own record's items.
+    for (const i of edit.event.merged ? edit.event.items.filter((x) => x.app === item.app && x.ref === item.ref) : edit.event.items) {
       writes.push({ col: listOf(i), id: i.id, data: null });
       undo.push({ col: listOf(i), id: i.id, data: stored(i) });
     }
@@ -283,8 +319,11 @@ function agendaChange(edit: Edit, ctx: ApplyContext): { writes: Op[]; undo: Op[]
 
 const CHANGE_NAMES: Record<AgendaEditKind, string> = { reschedule: 'moved', retime: 'retimed', rename: 'renamed', notes: 'notes', skip: 'skipped', cancel: 'cancelled' };
 
-/** The id of the history entry: the same change applied twice (a retried run) is refused the second time. */
-export const changeId = (gid: string, at: number, kind: string) => `g${contentHash(`${gid}|${at}|${kind}`)}`;
+/**
+ * The id of the history entry: the same change applied twice (a retried run) is refused the second
+ * time. A change to a merged event is one entry per record (`record`).
+ */
+export const changeId = (gid: string, at: number, kind: string, record?: string) => `g${contentHash(`${gid}|${at}|${kind}${record ? `|${record}` : ''}`)}`;
 
 /**
  * Applies one edit as the person, all at once: the app's writes, the agenda's, and the history
@@ -336,7 +375,7 @@ export async function applyEdit(edit: Edit & { gid: string }, ctx: ApplyContext)
     by: ctx.view.email,
   };
   try {
-    await db.commit([...ops.map(toWrite), ...agenda.writes.map(toWrite), { path: `${base}/calendarChanges/${changeId(edit.gid, edit.at, kind)}`, create: entry }]);
+    await db.commit([...ops.map(toWrite), ...agenda.writes.map(toWrite), { path: `${base}/calendarChanges/${changeId(edit.gid, edit.at, kind, edit.event.merged ? `${item.app}|${item.ref}|${edit.values.original ?? ''}` : undefined)}`, create: entry }]);
   } catch (e) {
     if (e instanceof FirestoreError && e.code === 'already-exists') return 'already';
     if (e instanceof FirestoreError && (e.code === 'permission-denied' || e.code === 'invalid-argument' || e.code === 'failed-precondition')) return 'refused';

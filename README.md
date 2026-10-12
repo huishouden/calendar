@@ -35,6 +35,9 @@ The model comes from `@huishouden/pwa-kit/calendar-export` (see the kit's
 events:
 
 - one event per item;
+- one event for items of several records that happen together (the same app's `merge` key, time and
+  readers: garbage and recycling on the same morning, `@huishouden/pwa-kit/merge`); series that share
+  some days repeat as one on those days and each on its own other days;
 - one repeating event per regular event (RRULE from the schedule, EXDATE for skipped days, overrides
   for moved ones);
 - stable keys, and a hash of what each event shows.
@@ -144,6 +147,11 @@ a round of the sync runs for the person:
    | One occurrence of a series deleted | `skip` |
    | A one-off event deleted | `cancel` |
    | A whole series deleted | Taken out of this person's calendar only. The household keeps it. |
+
+   **Merged events** (`@huishouden/pwa-kit/merge`: garbage and recycling on the same morning, one
+   event for several records): a move, a skip or a deletion goes to each record, one edit and one
+   history entry each; a new title, notes or a series' new time can't be said for several records
+   and are put back. Records that merge are exported in the same part (`exportClusters`).
 
    Anything else, or anything the person may not change, is put back as the app has it on the
    next push. The portal then says that a change couldn't be applied. A change already in the app
