@@ -105,13 +105,30 @@ describe('the feed', () => {
 
   test('settings: hidden apps, Health detail, and the person’s language', async () => {
     const secret = await setUpFeed('alice@example.com', { lang: 'es' });
-    await writeDoc(`households/${household}/calendarSettings/alice@example.com`, { hiddenApps: ['baby'], todos: false, bills: true, healthDetail: true, done: true, updatedAt: 5, by: 'alice@example.com' });
+    await writeDoc(`households/${household}/calendarSettings/alice@example.com`, { hiddenApps: ['baby'], todos: false, healthDetail: true, done: true, updatedAt: 5, by: 'alice@example.com' });
     await refresh(w);
     const ics = await (await get(secret)).text();
     expect(summaries(ics)).not.toContain('Checkup');
     expect(ics).toContain('Amoxicillin');
     expect(summaries(ics)).toContain('Recogida de basura');
     expect(summaries(ics).some((s) => s.startsWith('Pendiente'))).toBe(false);
+  });
+
+  test('Bills hidden through hiddenApps, or by a stored legacy bills: false, leaves the power bill out; bills: true leaves it in', async () => {
+    const secret = await setUpFeed('bob@example.com');
+    const settings = (extra: Record<string, unknown>) =>
+      writeDoc(`households/${household}/calendarSettings/bob@example.com`, { hiddenApps: [], todos: true, healthDetail: false, done: true, updatedAt: 5, by: 'bob@example.com', ...extra });
+    const power = async () => summaries(await (await get(secret)).text()).includes('Power bill');
+    expect(await power()).toBe(true);
+    await settings({ hiddenApps: ['bills'] });
+    await refresh(w);
+    expect(await power()).toBe(false);
+    await settings({ bills: false });
+    await refresh(w);
+    expect(await power()).toBe(false);
+    await settings({ bills: true });
+    await refresh(w);
+    expect(await power()).toBe(true);
   });
 
   test("the household's home: Home events carry its address as LOCATION, and the feed keeps the home's zone", async () => {
@@ -192,7 +209,7 @@ describe('the feed', () => {
   test('a change in the portal (Health details on) reaches the feed within seconds of the calendar app asking', async () => {
     const secret = await setUpFeed('alice@example.com');
     expect(await (await get(secret)).text()).not.toContain('Amoxicillin');
-    await writeDoc(`households/${household}/calendarSettings/alice@example.com`, { hiddenApps: [], todos: true, bills: true, healthDetail: true, done: true, updatedAt: 7, by: 'alice@example.com' });
+    await writeDoc(`households/${household}/calendarSettings/alice@example.com`, { hiddenApps: [], todos: true, healthDetail: true, done: true, updatedAt: 7, by: 'alice@example.com' });
     w.clock.now += 10_000;
     // The request serves what is stored and asks for a check of its person, after the answer.
     checksAsked = [];
