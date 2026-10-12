@@ -1,3 +1,4 @@
+import { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { exportEvents, exportIcs, loadExportLang, type ExportEvent } from '@huishouden/pwa-kit/calendar-export';
 import { icsProblems } from '@huishouden/pwa-kit/ics';
@@ -59,7 +60,7 @@ async function busy({ series = 12, singles = 110, todos = 20 } = {}): Promise<vo
 }
 
 const loadAs = async (email: string) => {
-  const p = new Person(w.env, { household, email, refreshToken: refreshFor(email) }, w.fetch);
+  const p = new Person(w.env, { household, email, refreshToken: refreshFor(email) }, w.fetch, undefined, new ReadBudget());
   const view = await p.view();
   return { view, loaded: await p.load(view, w.clock.now) };
 };

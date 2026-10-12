@@ -1,5 +1,6 @@
 import { exchangeRefreshToken, FirebaseAuthError, IdTokenCache, type AuthRestOptions } from '@huishouden/pwa-kit/firebase-auth-rest';
 import { decodeFields, FirestoreError, FirestoreRest, type Doc, type FieldFilter } from '@huishouden/pwa-kit/firestore-rest';
+import type { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { PERSONAL_AGENDA, toAgendaItem, type AgendaItem } from '@huishouden/pwa-kit/agenda-core';
 import { PERSONAL_TODOS, toTodoItem, type TodoItem } from '@huishouden/pwa-kit/todo-core';
 import { isRestricted, ROLES, type Role } from '@huishouden/pwa-kit/role-core';
@@ -39,43 +40,6 @@ export const forgetTokens = () => caches.clear();
 
 /** The person is no longer in the household, or never was. */
 export class NotMember extends Error {}
-
-/** Firestore reads billed so far, counted by the `Person` (or `Person`s) sharing it. */
-export interface ReadCount {
-  n: number;
-}
-
-/**
- * Firestore over REST, counting the reads it is billed for: each document a query returns and at
- * least one per query, one per 1,000 index entries an aggregation counts, each document a get asks
- * for, found or not.
- */
-class CountingFirestore extends FirestoreRest {
-  constructor(
-    options: ConstructorParameters<typeof FirestoreRest>[0],
-    readonly reads: ReadCount,
-  ) {
-    super(options);
-  }
-
-  override async get(path: string) {
-    const doc = await super.get(path);
-    this.reads.n += 1;
-    return doc;
-  }
-
-  override async query(...args: Parameters<FirestoreRest['query']>) {
-    const docs = await super.query(...args);
-    this.reads.n += Math.max(1, docs.length);
-    return docs;
-  }
-
-  override async aggregate(...args: Parameters<FirestoreRest['aggregate']>) {
-    const result = await super.aggregate(...args);
-    this.reads.n += Math.max(1, Math.ceil(result.count / 1000));
-    return result;
-  }
-}
 
 export interface View {
   household: string;
@@ -145,24 +109,26 @@ export class Person {
   constructor(
     readonly env: Env,
     readonly record: Pick<PersonRecord, 'household' | 'email' | 'refreshToken'>,
-    fetchImpl?: Fetch,
-    firestoreUrl?: string,
-    /** Where the reads this person's calls are billed for are counted (a round's, src/round.ts). */
-    readonly reads: ReadCount = { n: 0 },
+    fetchImpl: Fetch | undefined,
+    firestoreUrl: string | undefined,
+    /**
+     * What this person's Firestore calls are counted and capped by (the kit's `ReadBudget`: billed
+     * reads from each response, a run cap, the day's share, the quota pause): a round's unit's, a
+     * check's, an inbox unit's (src/budget.ts `runBudget`), or a portal request's (`requestBudget`).
+     * Required, so no code path reads without one.
+     */
+    readonly budget: ReadBudget,
   ) {
     const cache = tokenCache(env, fetchImpl);
     this.token = async () => (await cache.get(record.refreshToken)).token;
-    this.fetchImpl = fetchImpl ?? ((url, init) => fetch(url, init));
+    this.fetchImpl = budget.fetch(fetchImpl ?? ((url, init) => fetch(url, init)));
     this.firestoreUrl = (firestoreUrl ?? env.FIRESTORE_URL ?? 'https://firestore.googleapis.com/v1').replace(/\/$/, '');
-    this.db = new CountingFirestore(
-      {
-        projectId: env.FIREBASE_PROJECT_ID,
-        token: this.token,
-        ...(fetchImpl ? { fetch: fetchImpl } : {}),
-        ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}),
-      },
-      reads,
-    );
+    this.db = new FirestoreRest({
+      projectId: env.FIREBASE_PROJECT_ID,
+      token: this.token,
+      fetch: this.fetchImpl,
+      ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}),
+    });
     this.base = `households/${record.household}`;
   }
 
@@ -182,11 +148,10 @@ export class Person {
       throw new FirestoreError('unavailable', 'Firestore unreachable');
     }
     const parsed = (await res.json().catch(() => null)) as unknown;
-    if (res.ok) this.reads.n += paths.length;
     if (!res.ok || !Array.isArray(parsed)) {
       const error = (Array.isArray(parsed) ? parsed[0] : parsed) as { error?: { status?: string } } | null;
       const status = error?.error?.status ?? '';
-      throw new FirestoreError(status === 'PERMISSION_DENIED' || res.status === 403 ? 'permission-denied' : status === 'UNAVAILABLE' ? 'unavailable' : 'unknown', `Firestore ${res.status} ${status}`.trim());
+      throw new FirestoreError(status === 'PERMISSION_DENIED' || res.status === 403 ? 'permission-denied' : status === 'UNAVAILABLE' ? 'unavailable' : status === 'RESOURCE_EXHAUSTED' || res.status === 429 ? 'resource-exhausted' : 'unknown', `Firestore ${res.status} ${status}${error?.error && 'message' in error.error ? `: ${String((error.error as { message?: string }).message)}` : ''}`.trim());
     }
     const found = new Map<string, Record<string, unknown>>();
     for (const r of parsed as { found?: { name: string; fields?: Record<string, never> } }[]) {
@@ -377,7 +342,6 @@ export const signalFrom = (view: View, tallies: Tally[], extra: string): string 
   contentHash(JSON.stringify([...tallies, view.role, view.settingsAt, view.settings, extra]));
 
 /** Firestore said the project's daily quota is used up (429 RESOURCE_EXHAUSTED; Spark resets at midnight Pacific). */
-export const overQuota = (e: unknown): boolean => e instanceof FirestoreError && /\b429\b|RESOURCE_EXHAUSTED/.test(e.message);
 
 /** Whether an error means the person's sign-in is gone for good (signed out everywhere, account disabled). */
 export const signInGone = (e: unknown): boolean => e instanceof FirebaseAuthError && e.kind === 'revoked';

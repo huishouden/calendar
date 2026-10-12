@@ -1,3 +1,4 @@
+import { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
 import { checkPeople, dueAnyway, householdDue, ACTIVE_MS, QUIET_EVERY_MIN } from '../src/check';
@@ -21,7 +22,7 @@ beforeEach(async () => {
 });
 
 const MIN = 60_000;
-const person = (email: string) => new Person(w.env, { household, email, refreshToken: refreshFor(email) }, w.fetch);
+const person = (email: string) => new Person(w.env, { household, email, refreshToken: refreshFor(email) }, w.fetch, undefined, new ReadBudget());
 /** Loads as `email` and says how each list was read. */
 async function load(email: string, now = w.clock.now) {
   const p = person(email);

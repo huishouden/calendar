@@ -1,3 +1,4 @@
+import { firestoreQuota, refusedBy, requestBudget } from './budget';
 import { exchangeRefreshToken, FirebaseAuthError, jwtClaims } from '@huishouden/pwa-kit/firebase-auth-rest';
 import { FirestoreError, FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
 import { isLang, type Lang } from '@huishouden/pwa-kit/i18n';
@@ -6,7 +7,7 @@ import { householdTimeZone, toHome } from '@huishouden/pwa-kit/home';
 import type { Env, Fetch } from './env';
 import { feedUrl } from './feed';
 import { log } from './log';
-import { authOptions, overQuota, roleOf } from './person';
+import { authOptions, roleOf } from './person';
 import { Calendar, CalendarApiError } from './google/api';
 import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, redirectUriFor, revokeGoogle } from './google/oauth';
 import { deletePerson, deletePersonRows, loadPerson, moveFeed, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
@@ -78,8 +79,15 @@ interface Caller {
 
 const HOUSEHOLD = /^[A-Za-z0-9_-]{1,128}$/;
 
-/** 503, saying which: `firestore-quota` (back after the daily reset; retrying sooner only uses requests) or `unavailable`. */
-const unavailable = (e: unknown) => new HttpError(503, overQuota(e) ? 'firestore-quota' : 'unavailable');
+/**
+ * 503, saying which: `firestore-quota` (the project's day is used up: back after the daily reset;
+ * retrying sooner only uses requests), `read-budget` (this request read past REQUEST_READS: a fault
+ * here, not the project's quota) or `unavailable`.
+ */
+const unavailable = (e: unknown) => new HttpError(503, readFailure(e) ?? 'unavailable');
+
+/** Which read failure an error is: Firestore's own quota, this request's read budget, or neither. */
+export const readFailure = (e: unknown): 'firestore-quota' | 'read-budget' | null => (firestoreQuota(e) ? 'firestore-quota' : refusedBy(e) ? 'read-budget' : null);
 
 /** The token's person (uid, verified email) if its claims are for this project and unexpired; null otherwise. */
 function claimedPerson(env: Env, idToken: string, now = Date.now()): { uid: string; email: string } | null {
@@ -107,7 +115,8 @@ async function caller(env: Env, request: Request, household: string | null, fetc
   const who = claimedPerson(env, idToken);
   if (!who) throw new HttpError(401, 'sign-in');
   // A member reads their household; anyone else is refused by the rules.
-  const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, ...(fetchImpl ? { fetch: fetchImpl } : {}), ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}) });
+  // A member's own request: counted and capped (src/budget.ts `requestBudget`).
+  const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, fetch: requestBudget().fetch(fetchImpl ?? ((url, init) => fetch(url, init))), ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}) });
   // Only the rules' refusal (or no such household) means "not a member". Anything else, such as
   // Firestore's daily quota (429 RESOURCE_EXHAUSTED) or an outage, is the service being unavailable.
   const doc = await db.get(`households/${household}`).catch((e: unknown) => {
@@ -320,9 +329,12 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
       log('api', { route: url.pathname, ok: false, status: e.status, code: e.code, ...(e.detail ? { detail: e.detail } : {}) });
       return json(e.status, { error: e.code }, headers);
     }
-    if (overQuota(e)) {
-      log('api', { route: url.pathname, ok: false, status: 503, code: 'firestore-quota' });
-      return json(503, { error: 'firestore-quota' }, { ...headers, 'Retry-After': '3600' });
+    // Firestore's quota (back after the daily reset), or this request's own cap, logged as what it is
+    // so a runaway request isn't read as the project's quota.
+    const failure = readFailure(e);
+    if (failure) {
+      log('api', { route: url.pathname, ok: false, status: 503, code: failure });
+      return json(503, { error: failure }, failure === 'firestore-quota' ? { ...headers, 'Retry-After': '3600' } : headers);
     }
     log('api', { route: url.pathname, ok: false, status: 500, ...causeOf(e) });
     return json(500, { error: 'server' }, headers);

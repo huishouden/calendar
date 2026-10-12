@@ -1,3 +1,4 @@
+import { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
 import { MAX_WRITES } from '../src/sync';
@@ -212,7 +213,7 @@ describe('fan-out and the queue', () => {
   test('the signal from the loaded agenda equals the aggregations’ (so a unit needn’t ask twice), for every role', async () => {
     const { Person } = await import('../src/person');
     for (const email of ['alice@example.com', 'bob@example.com', 'helen@example.com', 'kim@example.com']) {
-      const p = new Person(w.env, { household, email, refreshToken: refreshFor(email) }, w.fetch);
+      const p = new Person(w.env, { household, email, refreshToken: refreshFor(email) }, w.fetch, undefined, new ReadBudget());
       const view = await p.view();
       expect(p.signalOf(view, await p.load(view), 'x')).toBe(await p.signal(view, 'x'));
     }

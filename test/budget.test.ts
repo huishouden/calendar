@@ -1,9 +1,9 @@
+import { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { handleApi } from '../src/api';
 import { checkPeople } from '../src/check';
 import { FEED, markWork, runWork } from '../src/work';
 import { FIRESTORE_PAUSE_MS, forgetWorkReads, quotaDay, READ_BACKOFF_MS, ROUND_READS, untilNextDay, workReadsKey } from '../src/budget';
-import { FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
 import { loadPerson, openFeedBody, personId } from '../src/store';
 import { captureLogs } from '../src/log';
 import { apiRequest, drain, household, readDoc, refreshFor, resetFirestore, seed, world, TZ, type World } from './helpers/world';
@@ -173,19 +173,18 @@ describe('a round that keeps reading', () => {
 });
 
 describe('what is counted', () => {
-  test("the kit's Firestore client reads only through get, query and aggregate, one request each (Person counts those and its own batchGet)", async () => {
-    // A kit bump that adds a read method fails here, before it can read past the budget uncounted.
-    const methods = Object.getOwnPropertyNames(FirestoreRest.prototype).filter((m) => m !== 'constructor').sort();
-    expect(methods).toEqual(['aggregate', 'call', 'commit', 'docOf', 'get', 'query']);
-    // And none of them pages: a query of more documents than one page holds is still one request.
+  test("every Firestore call a Person makes goes through its budget: the kit's count is what the wire bills", async () => {
+    // A query of more documents than one page holds is still one request, billed each document.
     await many(320);
     const c = counting();
-    const p = new (await import('../src/person')).Person(w.env, { household, email: 'alice@example.com', refreshToken: refreshFor('alice@example.com') }, c.fetch);
+    const p = new (await import('../src/person')).Person(w.env, { household, email: 'alice@example.com', refreshToken: refreshFor('alice@example.com') }, c.fetch, undefined, new ReadBudget());
     const docs = await p.db.query(`households/${household}`, 'agenda');
     expect(docs.length).toBeGreaterThan(320);
+    await p.getAll([`households/${household}`, `households/${household}/calendarSettings/alice@example.com`]);
+    await p.db.aggregate(`households/${household}`, 'agenda', {}, ['updatedAt']);
     expect(c.seen.queries).toBe(1);
-    expect(p.reads.n).toBe(docs.length);
-    expect(c.seen.reads).toBe(docs.length);
+    expect(p.budget.reads).toBe(docs.length + 2 + 1);
+    expect(c.seen.reads).toBe(p.budget.reads);
   });
 });
 

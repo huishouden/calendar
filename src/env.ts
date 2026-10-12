@@ -27,7 +27,8 @@ export interface Env {
   SELF?: FanoutRpc;
   /**
    * Firestore reads a day the checks may use (src/tick.ts `periodsFor`): they check less often
-   * rather than go over it. Unset: no limit (a project on the Blaze plan).
+   * rather than go over it, and stop for the day at it (src/budget.ts). Unset: no limit (a project
+   * on the Blaze plan).
    */
   FIRESTORE_CHECK_READS?: string;
   /**
@@ -35,6 +36,11 @@ export interface Env {
    * work waits for the next day (midnight Pacific). Unset: no limit.
    */
   FIRESTORE_WORK_READS?: string;
+  /**
+   * Firestore reads a day the alert inboxes' units may use (src/mail/work.ts, src/budget.ts): past
+   * it, the inboxes wait for the next day. Unset: no limit.
+   */
+  FIRESTORE_MAIL_READS?: string;
   /** Extra roots for the minute's checks (src/ticker.ts): each Ticker's alarm is its own top-level invocation. */
   TICKER?: DurableObjectNamespace<TickerRpc>;
   /** Firestore's REST base, for the emulator in tests and `wrangler dev`; production leaves it out. */

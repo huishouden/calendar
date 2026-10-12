@@ -1,3 +1,4 @@
+import type { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { FieldDelete, FirestoreError } from '@huishouden/pwa-kit/firestore-rest';
 import { ALERT_INBOXES, alertQuery, DEFAULT_RULES, type AlertCard, type CategoryRule } from '@huishouden/pwa-kit/spending-core';
 import type { Env, Fetch } from '../env';
@@ -16,7 +17,8 @@ export const SEARCH_MARGIN_MS = 24 * 3_600_000;
 /** The Gmail search for alerts after `since`, or null when the household has nothing to search for. */
 export const searchFor = (config: InboxConfig, since: number): string | null => alertQuery(config.cards, config.labels, { after: Math.max(0, since - SEARCH_MARGIN_MS) });
 
-export const actingAs = (env: Env, record: InboxRecord, fetchImpl?: Fetch, firestoreUrl?: string) => new Person(env, { household: record.household, email: record.email, refreshToken: record.refreshToken }, fetchImpl, firestoreUrl);
+export const actingAs = (env: Env, record: InboxRecord, fetchImpl: Fetch | undefined, firestoreUrl: string | undefined, budget: ReadBudget) =>
+  new Person(env, { household: record.household, email: record.email, refreshToken: record.refreshToken }, fetchImpl, firestoreUrl, budget);
 
 const str = (v: unknown) => (typeof v === 'string' ? v : '');
 const strList = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);

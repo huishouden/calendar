@@ -2,13 +2,14 @@ import { FirestoreError } from '@huishouden/pwa-kit/firestore-rest';
 import { FirebaseAuthError } from '@huishouden/pwa-kit/firebase-auth-rest';
 import type { Env, Fetch } from './env';
 import { log } from './log';
-import { NotMember, overQuota, Person, signalExtra, signInGone, type Shared } from './person';
+import { NotMember, Person, signalExtra, signInGone, type Shared } from './person';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './google/api';
 import { eventRows, openPerson, savePerson, sealCounts, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
 import { FULL_EVERY_MS, isEcho } from './sync';
 import { dropFeed, markWork } from './work';
-import { pauseFirestore } from './budget';
+import { firestoreQuota, refusedBy, runBudget } from './budget';
+import type { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { FEED, SYNC } from './round';
 
 /**
@@ -73,6 +74,10 @@ export interface CheckTotals {
   /** People left for another invocation: this one's subrequests ran out. */
   deferred: string[];
   paused: boolean;
+  /** Firestore reads this invocation was billed for. */
+  reads?: number;
+  /** The checks' share of the day (FIRESTORE_CHECK_READS) or this invocation's cap (CHECK_READS) refused. */
+  budget?: string;
   /** Google people whose household side wasn't due this time (quiet: see `householdDue`). */
   quiet: number;
 }
@@ -93,6 +98,16 @@ export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}
   )
     .bind(...pids)
     .all<CheckRow>();
+  // The invocation's reads: counted, capped at CHECK_READS, added to the checks' share of the day.
+  const budget = runBudget(env, 'check', now);
+  const gate = await budget.begin();
+  if (gate) {
+    totals.paused = gate.scope === 'paused';
+    if (!totals.paused) totals.budget = gate.scope;
+    totals.skipped = results.length;
+    log('check', { ok: false, reason: gate.scope === 'paused' ? 'paused' : 'budget', reads: gate.reads });
+    return totals;
+  }
   const shared: Shared = new Map();
   let done = 0;
   for (const row of results) {
@@ -107,15 +122,22 @@ export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}
       continue;
     }
     try {
-      const kinds = await checkOne(env, row, { ...deps, fetch: counted, now }, shared, totals);
+      const kinds = await checkOne(env, row, { ...deps, fetch: counted, now }, shared, totals, budget);
       totals.checked++;
       if (kinds) {
         totals.marked++;
         if (await markWork(env, row.pid, kinds, now)) totals.sent++;
       }
     } catch (e) {
-      if (overQuota(e)) {
-        await pauseFirestore(env, now);
+      const by = refusedBy(e);
+      if (by) {
+        // This invocation's cap or the day's share: the rest wait for a later check.
+        totals.budget = by;
+        log('check', { ok: false, reason: 'budget', budget: by, reads: budget.reads });
+        break;
+      }
+      if (firestoreQuota(e)) {
+        // The budget paused checks and work (`firestore-pause`) when Firestore said its quota is used up.
         totals.paused = true;
         log('check', { paused: 'firestore-quota' });
         break;
@@ -129,13 +151,15 @@ export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}
       }
     }
   }
+  await budget.finish();
+  totals.reads = budget.reads;
   return totals;
 }
 
 type CheckRow = PersonRow & { feed_signal: string | null; feed_stale: number | null };
 
 /** The work one person needs (FEED | SYNC), or 0. */
-async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetch; now: number }, shared: Shared, totals: CheckTotals): Promise<number> {
+async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetch; now: number }, shared: Shared, totals: CheckTotals, budget: ReadBudget): Promise<number> {
   const { now } = deps;
   const record = await openPerson(env, row.pid, row.record);
   if (!record) return 0;
@@ -180,7 +204,7 @@ async function checkOne(env: Env, row: CheckRow, deps: CheckDeps & { fetch: Fetc
     totals.quiet++;
     return kinds;
   }
-  const person = new Person(env, record, deps.fetch, deps.firestoreUrl);
+  const person = new Person(env, record, deps.fetch, deps.firestoreUrl, budget);
   let signal: string;
   let counts: string | null;
   try {

@@ -55,7 +55,7 @@ location (`LOCATION` in the feed, `location` in Google).
 | `src/tick.ts` | The cron: who is due this minute, checked a few at a time in their own invocations |
 | `src/check.ts` | The cheap check for a few people: did anything they see change? Marks and queues the work |
 | `src/work.ts` | One unit of a person's work per invocation, the next one handed the lease and the round straight after. Lease, back-off |
-| `src/budget.ts` | The work's Firestore reads: the day's count and budget (`FIRESTORE_WORK_READS`), the pause when Firestore's quota is used up |
+| `src/budget.ts` | Firestore reads on the kit's `ReadBudget`: a cap per check, round unit and inbox unit, each kind's share of the day (`FIRESTORE_CHECK_READS`, `FIRESTORE_WORK_READS`, `FIRESTORE_MAIL_READS`) in D1's `meta`, the pause when Firestore's quota is used up |
 | `src/round.ts` | A feed build or a sync round in units of at most 6 subrequests and 60 items: its steps, and what one unit hands the next |
 | `src/person.ts` | Acting as the person: their ID token on every Firestore call, their role and settings, the change signal |
 | `src/sync.ts` | What a person's Google sync writes: echoes of our own writes, the writes and rows for each event |
@@ -261,7 +261,8 @@ The limits that shape it:
    https://cloud.google.com/firestore/pricing "Minimum charge for queries"), counted for a quarter of
    the day active (`googleChecksPerDay`). Once an hour, the cron works out how often it can check
    everyone within it (every 5, 10, 15, 20, 30 or 60 minutes) and checks less often rather than go
-   over it. When Firestore answers 429 anyway, the checks stop for 15 minutes.
+   over it, and stop for the day once the checks' reads (counted in D1's `meta`) reach it. When
+   Firestore answers 429 anyway, the checks and the work stop for 15 minutes.
 5. **Loads read what changed** (`src/lists.ts`): a sync round or a feed build needs the four lists.
    Each is kept in D1 between loads (sealed, per household and restricted flag for the shared
    lists, per member for personal ones), and a load first asks its count and sum of `updatedAt`
@@ -302,9 +303,9 @@ a Google person gets about 144 a day (96 while quiet, every 15 minutes, plus eve
 quarter of the day their household is active): 1,000 people is ~860,000 reads a day, against 50,000
 a day on the free Spark plan for everything. Loads add little: 3 changes × 2 loads (sync and feed)
 × ~7 reads (four aggregations, a query for what changed, a document or two) is ~42 a person, where
-reading every document was ~700 (3 × 2 × ~115). With `FIRESTORE_CHECK_READS = 20000` (40% of the free reads), Spark keeps
-5-minute Google checks for about 23 people (20,000 ÷ (144 × 6)) or 34 with only a feed
-(20,000 ÷ (96 × 6)). Past that, the checks space out on their own, down to hourly. 1,000 people
+reading every document was ~700 (3 × 2 × ~115). With `FIRESTORE_CHECK_READS = 12000` (24% of the free reads; the
+suite's allocation is in pwa-kit STANDARD.md "Read budgets"), Spark keeps 5-minute Google checks for
+about 13 people (12,000 ÷ (144 × 6)) or 20 with only a feed (12,000 ÷ (96 × 6)). Past that, the checks space out on their own, down to hourly. 1,000 people
 within 5 to 15 minutes of a change needs the project on Blaze: ~860,000 reads a day is $0.25 to $0.50
 a day after the free 50,000 ($0.03 to $0.06 per 100,000 reads, by the database's location). Then
 raise or unset `FIRESTORE_CHECK_READS`.
@@ -436,15 +437,30 @@ limit is the binding one: 100 accounts while the app is unverified.
   reads), Firestore answers 429 until midnight Pacific time: the portal's calls get 503
   `firestore-quota` (the portal says so, rather than "couldn't reach"), feeds serve what is stored,
   and the checks and the work pause for 15 minutes at a time.
-- **The work's reads are bounded** (`src/budget.ts`, `src/round.ts`). A feed build or a sync round
-  may be billed for at most 2,500 reads (`ROUND_READS`, 5% of the free 50,000); past it the round is
-  dropped and the person waits an hour, with a `"reason":"read-budget"` line. All the work together may use
-  `FIRESTORE_WORK_READS` a day (10,000; staging 5,000), counted per quota day (midnight Pacific) in
-  D1's `meta`; past it, work waits for the next day. With the checks' 20,000 that keeps the Worker
-  under 30,000 of the project's 50,000. Each unit logs what it was billed for (`"event":"work"`,
-  `reads`), and each finished round its total (`"event":"round"`, `kind`, `reads`); the logs name no
-  one. Whose round it was is in D1: each person's last round's reads are on their row
-  (`SELECT pid, round_reads, round_reads_at FROM people ORDER BY round_reads DESC`).
+- **Every Firestore read is counted and capped** (`src/budget.ts`, the kit's `ReadBudget`, pwa-kit
+  STANDARD.md "Read budgets"). Each kind of run has a cap and a share of the day, counted per quota
+  day (midnight Pacific) in D1's `meta`:
+
+  | Run | Cap | Share a day (production; staging) |
+  |---|---|---|
+  | A check invocation | 300 (`CHECK_READS`) | `FIRESTORE_CHECK_READS` 12,000; 5,000 |
+  | A feed build or sync round | 2,500 a unit, and the round as a whole (`ROUND_READS`, 5% of the free 50,000) | `FIRESTORE_WORK_READS` 6,000; 5,000 |
+  | A unit of an alert inbox | 400 (`MAIL_READS`) | `FIRESTORE_MAIL_READS` 2,000; 1,000 |
+  | A portal request (a member's own action: their calendar's status, an inbox's) | 200 (`REQUEST_READS`) | none: capped, not counted against a day |
+
+  A round past its cap is dropped and the person waits an hour (`"reason":"read-budget"`); an inbox
+  unit past its cap waits an hour. A spent share stops that kind of run until the next day. A portal request past its cap answers 503
+  `read-budget` (not `firestore-quota`, which means the project's day is used up). Together
+  the shares are 20,000 of the project's 50,000. Every Firestore call goes through the budget, which
+  counts what each answer is billed for (`billedReads`), so a new code path can't read uncounted.
+  Each check invocation logs its reads (`"event":"tick"`, `reads`), each unit what it was billed for
+  (`"event":"work"`, `"event":"mail"`, `reads`), and each finished round its total (`"event":"round"`,
+  `kind`, `reads`); the logs name no one. Whose round it was is in D1: each person's last round's
+  reads are on their row (`SELECT pid, round_reads, round_reads_at FROM people ORDER BY round_reads DESC`).
+- **Read-budget tests** (`test/read-budgets.test.ts`): each kind of run on the fixture household has
+  a ceiling on what Firestore bills for it, and a feed round and a sync round run with another
+  member's write landing before every read must finish within theirs. Without the 2026-10-12 fix
+  those two read about 2,500 each (stopped by the cap) instead of 10.
 - **CPU**: the free plan allows 10 ms per invocation. A feed request serves what is stored, at
   1 to 2 ms. A check is 2 people. A feed build or a sync round is a chain of units
   (`src/round.ts`), each its own invocation with at most 6 subrequests (about 1 ms of CPU each) and

@@ -73,12 +73,13 @@ ALLOWED_ORIGINS = "https://huishouden-piekstra.web.app"
 # Authorized redirect URIs list them (Calendar's page in the portal, Spending's alert inbox).
 GOOGLE_REDIRECT_URIS = "https://huishouden-piekstra.web.app/my-calendar https://huishouden-piekstra.web.app/spending/"
 CALENDAR_NAME = "Huishouden"
-# Firestore reads a day the checks may use, of the free plan's 50,000 shared with every app
-# (README, "Many households"). They check less often rather than go over it.
-FIRESTORE_CHECK_READS = "20000"
-# Firestore reads a day the work (feed builds, sync rounds) may use (src/budget.ts); a round alone at
-# most 2,500 (src/round.ts ROUND_READS). Checks and work together stay under 30,000.
-FIRESTORE_WORK_READS = "10000"
+# Firestore reads a day each kind of run may use, of the free plan's 50,000 shared with every app
+# and Worker (pwa-kit STANDARD.md "Read budgets" allocates them; README, "Limits"): the checks
+# (they check less often rather than go over, and stop for the day at it), the work (feed builds and
+# sync rounds; a round alone at most 2,500), Spending's alert inboxes. 20,000 together.
+FIRESTORE_CHECK_READS = "12000"
+FIRESTORE_WORK_READS = "6000"
+FIRESTORE_MAIL_READS = "2000"
 
 [env.staging]
 name = "huishouden-calendar-staging"
@@ -130,3 +131,4 @@ CALENDAR_NAME = "Huishouden (staging)"
 # Staging's reads mostly go to the apps' CI.
 FIRESTORE_CHECK_READS = "5000"
 FIRESTORE_WORK_READS = "5000"
+FIRESTORE_MAIL_READS = "1000"

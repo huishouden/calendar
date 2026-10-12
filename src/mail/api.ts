@@ -1,3 +1,4 @@
+import { requestBudget } from '../budget';
 import { exchangeRefreshToken, FirebaseAuthError } from '@huishouden/pwa-kit/firebase-auth-rest';
 import { FirestoreError, FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
 import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
@@ -162,7 +163,7 @@ export async function connectInbox(env: Env, who: MailCaller, b: Record<string, 
 
   const id = await inboxIdOf(who.household, address);
   const record: InboxRecord = { household: who.household, email: who.email, uid: who.uid, refreshToken: b.refreshToken, google: granted.refreshToken, address, timeZone, connectedAt: now };
-  const person = actingAs(env, record, deps.fetch, deps.firestoreUrl);
+  const person = actingAs(env, record, deps.fetch, deps.firestoreUrl, requestBudget());
   try {
     await person.db.commit([{ path: `${person.base}/${ALERT_INBOXES}/${id}`, set: inboxDoc(record, now) }]);
   } catch (e) {
@@ -201,7 +202,8 @@ export async function disconnectInbox(env: Env, who: MailCaller, b: Record<strin
   const db = new FirestoreRest({
     projectId: env.FIREBASE_PROJECT_ID,
     token: async () => who.idToken,
-    ...(deps.fetch ? { fetch: deps.fetch } : {}),
+    // A member's own request: counted and capped (src/budget.ts `requestBudget`).
+    fetch: requestBudget().fetch(deps.fetch ?? ((url, init) => fetch(url, init))),
     ...((deps.firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: deps.firestoreUrl ?? env.FIRESTORE_URL } : {}),
   });
   try {
@@ -265,7 +267,8 @@ export async function undoImport(env: Env, who: MailCaller, b: Record<string, un
   const db = new FirestoreRest({
     projectId: env.FIREBASE_PROJECT_ID,
     token: async () => who.idToken,
-    ...(deps.fetch ? { fetch: deps.fetch } : {}),
+    // A member's own request: counted and capped (src/budget.ts `requestBudget`).
+    fetch: requestBudget().fetch(deps.fetch ?? ((url, init) => fetch(url, init))),
     ...((deps.firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: deps.firestoreUrl ?? env.FIRESTORE_URL } : {}),
   });
   const base = `households/${who.household}`;

@@ -138,7 +138,7 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
   const now = deps.now ?? Date.now();
   const part = deps.part;
   const minute = Math.floor(now / 60_000) % 60;
-  const totals: Record<string, number> = { due: 0, calls: 0, checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, quiet: 0, deferred: 0, swept: 0, worked: 0 };
+  const totals: Record<string, number> = { due: 0, calls: 0, checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, quiet: 0, deferred: 0, swept: 0, worked: 0, reads: 0 };
   const pause = await env.DB.prepare("SELECT value FROM meta WHERE key = 'firestore-pause'").first<{ value: number }>();
   if (pause && pause.value > now) {
     log('tick', { minute, paused: 'firestore-quota' });
@@ -176,9 +176,10 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
         failed++;
         continue;
       }
-      for (const k of ['checked', 'marked', 'sent', 'echoes', 'skipped', 'errors', 'quiet'] as const) totals[k] += a.value[k] ?? 0;
+      for (const k of ['checked', 'marked', 'sent', 'echoes', 'skipped', 'errors', 'quiet', 'reads'] as const) totals[k] += a.value[k] ?? 0;
       deferred.push(...a.value.deferred);
-      paused ||= a.value.paused;
+      // The checks' share of the day spent: no more checks this minute (each waits for its next slot).
+      paused ||= a.value.paused || a.value.budget === 'check';
     }
     if (deferred.length) waiting = [...pack(deferred.map((pid) => ({ pid, hh: null }))), ...waiting];
   }

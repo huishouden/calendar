@@ -7,7 +7,8 @@ import type { Doc } from '@huishouden/pwa-kit/firestore-rest';
 import { LocalClock } from '@huishouden/pwa-kit/local-clock';
 import { globalFetch, type Env, type Fetch } from './env';
 import { log } from './log';
-import { langOf, loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type ReadCount, type View } from './person';
+import { langOf, loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type View } from './person';
+import type { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { readLists, tallyOf, type Tally } from './lists';
 import { ReadBudgetSpent, roundOverBudget } from './budget';
 import { seal, unseal } from './seal';
@@ -147,8 +148,8 @@ export interface RoundDeps {
   firestoreUrl?: string;
   /** The round as the unit before handed it over (sealed), when it came straight from that unit. */
   round?: string | null;
-  /** Counts the Firestore reads the unit is billed for, also when it throws. */
-  reads?: ReadCount;
+  /** Counts and caps the Firestore reads the unit is billed for (src/budget.ts `runBudget`), also when it throws. */
+  budget: ReadBudget;
 }
 
 
@@ -229,7 +230,7 @@ interface Ctx {
   firestoreUrl?: string;
   statements: D1PreparedStatement[];
   calls: { n: number };
-  reads: ReadCount;
+  budget: ReadBudget;
   limited: boolean;
   memo: Memo;
 }
@@ -254,7 +255,7 @@ export async function savedRound(env: Env, pid: string, row: PersonRow, kind: Ro
  * person who left the household loses their feed at once (`dropFeed`: its KV record can't join a
  * D1 batch; doing it again is harmless).
  */
-export async function runUnit(env: Env, pid: string, kind: RoundKind, row: PersonRow, record: PersonRecord, deps: RoundDeps = {}): Promise<UnitResult> {
+export async function runUnit(env: Env, pid: string, kind: RoundKind, row: PersonRow, record: PersonRecord, deps: RoundDeps): Promise<UnitResult> {
   const now = deps.now ?? Date.now();
   const calls = { n: 0 };
   const base = deps.fetch ?? globalFetch;
@@ -270,17 +271,17 @@ export async function runUnit(env: Env, pid: string, kind: RoundKind, row: Perso
     if (row.round || deps.round) statements.push(clearRoundItems(env, pid));
     state = fresh(kind, now, row, record);
   }
-  const reads = deps.reads ?? { n: 0 };
-  const before = reads.n;
+  const { budget } = deps;
+  const before = budget.reads;
   const billed = state.billed;
-  const ctx: Ctx = { env: cenv, pid, row, record, state, now, fetch: fetchImpl, firestoreUrl: deps.firestoreUrl, statements, calls, reads, limited: false, memo: {} };
+  const ctx: Ctx = { env: cenv, pid, row, record, state, now, fetch: fetchImpl, firestoreUrl: deps.firestoreUrl, statements, calls, budget, limited: false, memo: {} };
   const ran: Step[] = [];
   let next: Next;
   for (;;) {
     ran.push(state.step);
     next = await STEPS[state.step](ctx);
     // Checked after every step: a round that keeps reading stops here, whatever the reason.
-    state.billed = billed + reads.n - before;
+    state.billed = billed + budget.reads - before;
     if (roundOverBudget(state.billed)) throw new ReadBudgetSpent(state.billed);
     if (next === 'chain') continue;
     if (next !== 'continue' || ctx.limited || calls.n + stepCalls(ctx) > UNIT_CALLS) break;
@@ -302,7 +303,7 @@ export async function runUnit(env: Env, pid: string, kind: RoundKind, row: Perso
     finished: done ? kind | (state.feed ? FEED : 0) : 0,
     counts: state.counts,
     calls: calls.n,
-    reads: reads.n - before,
+    reads: budget.reads - before,
   };
 }
 
@@ -317,7 +318,7 @@ const STEPS: Record<Step, (ctx: Ctx) => Promise<Next>> = {
   write: writeStep,
 };
 
-const person = (ctx: Ctx) => new Person(ctx.env, ctx.record, ctx.fetch, ctx.firestoreUrl, ctx.reads);
+const person = (ctx: Ctx) => new Person(ctx.env, ctx.record, ctx.fetch, ctx.firestoreUrl, ctx.budget);
 
 const isSync = (ctx: Ctx) => ctx.state.kind === SYNC;
 /** Whether the round builds the feed: a feed round, or a sync round that does both. */

@@ -1,8 +1,9 @@
+import { firestoreQuota, READ_BACKOFF_MS, refusedBy, requestBudget, runBudget, untilNextDay } from '../budget';
 import { toMailMessage } from '@huishouden/pwa-kit/mail-core';
 import { MAX_ALERTS, transactionDoc } from '@huishouden/pwa-kit/spending-core';
 import type { Env, Fetch } from '../env';
 import { log } from '../log';
-import { overQuota, signInGone } from '../person';
+import { signInGone } from '../person';
 import { accessToken, GoogleAuthError, revokeGoogle } from '../google/oauth';
 import { REQUEUE_MS, type WorkOutcome } from '../work';
 import { Gmail, gmailRateLimited } from './gmail';
@@ -71,7 +72,7 @@ const backoffSeconds = (n: number) => Math.min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 
 export async function stopInbox(env: Env, row: Pick<InboxRow, 'id' | 'record'>, error: string, deps: Pick<MailWorkDeps, 'fetch' | 'firestoreUrl'>, now: number): Promise<void> {
   await env.DB.prepare('UPDATE inboxes SET error = ?, pending = 0, lease_until = NULL, queued_at = NULL, checked_at = ? WHERE id = ?').bind(error, now, row.id).run();
   const record = await openRecord(env, row);
-  if (record && error !== 'not-member' && error !== 'signed-out') await reportInbox(actingAs(env, record, deps.fetch, deps.firestoreUrl), row.id, { error }, now).catch(() => undefined);
+  if (record && error !== 'not-member' && error !== 'signed-out') await reportInbox(actingAs(env, record, deps.fetch, deps.firestoreUrl, requestBudget()), row.id, { error }, now).catch(() => undefined);
   log('mail', { stopped: error });
 }
 
@@ -97,17 +98,22 @@ export async function runMailWork(env: Env, id: string, deps: MailWorkDeps = {})
     await release('queued_at = NULL');
     return { done: true };
   }
-  const pause = await env.DB.prepare("SELECT value FROM meta WHERE key = 'firestore-pause'").first<{ value: number }>();
-  if (pause && pause.value > now) {
-    await release('');
-    return { retryAfter: Math.ceil((pause.value - now) / 1000), reason: 'backoff' };
+  // The unit's reads: counted, capped at MAIL_READS, added to the inboxes' share of the day (src/budget.ts).
+  const budget = runBudget(env, 'mail', now);
+  const gate = await budget.begin();
+  if (gate) {
+    // Paused (Firestore's quota), or the day's share spent: the inbox waits, its work still pending.
+    if (gate.scope === 'paused') await release('');
+    else await release('backoff_until = ?', now + gate.wait);
+    log('mail', { unit: true, ok: false, reason: gate.scope === 'paused' ? 'paused' : 'budget', reads: gate.reads });
+    return { retryAfter: Math.ceil(gate.wait / 1000), reason: gate.scope === 'paused' ? 'paused' : 'budget' };
   }
   const record = await openRecord(env, row);
   if (!record) {
     await deleteInbox(env, id);
     return { done: true };
   }
-  const person = actingAs(env, record, deps.fetch, deps.firestoreUrl);
+  const person = actingAs(env, record, deps.fetch, deps.firestoreUrl, budget);
   try {
     // The household's cards and rules: kept sealed for checks, read again when old or asked.
     let config: InboxConfig | null = row.config_at && now - row.config_at < CONFIG_MAX_AGE_MS ? await openConfig(env, row) : null;
@@ -196,7 +202,7 @@ export async function runMailWork(env: Env, id: string, deps: MailWorkDeps = {})
       more ? now : null,
       ...(added ? [now, added] : []),
     );
-    log('mail', { unit: true, found: found.length, read: batch.length, added, duplicates, review, more });
+    log('mail', { unit: true, found: found.length, read: batch.length, added, duplicates, review, more, reads: budget.reads });
     if (more) {
       if (deps.next) await deps.next(id).catch(() => sendMail(env, id));
       else await sendMail(env, id);
@@ -222,9 +228,19 @@ export async function runMailWork(env: Env, id: string, deps: MailWorkDeps = {})
       log('mail', { unit: true, ok: false, reason: 'rate-limited', backoff: wait });
       return { retryAfter: wait, reason: 'backoff' };
     }
-    const reason = overQuota(e) ? 'firestore' : 'gmail';
+    const by = refusedBy(e);
+    if (by) {
+      // Its cap (something read far more than a unit should: an hour's wait) or the day's share (until midnight Pacific).
+      const wait = by === 'mail' ? untilNextDay(now) : READ_BACKOFF_MS;
+      await release('backoff_until = ?', now + wait);
+      log('mail', { unit: true, ok: false, reason: 'read-budget', budget: by, reads: budget.reads });
+      return { retryAfter: Math.ceil(wait / 1000), reason: 'budget' };
+    }
+    const reason = firestoreQuota(e) ? 'firestore' : 'gmail';
     await release('error = ?, checked_at = ?', reason, now);
-    log('mail', { unit: true, ok: false, reason, kind: e instanceof Error ? e.constructor.name : typeof e });
+    log('mail', { unit: true, ok: false, reason, kind: e instanceof Error ? e.constructor.name : typeof e, reads: budget.reads });
     return { retryAfter: 60, reason: 'error' };
+  } finally {
+    await budget.finish();
   }
 }

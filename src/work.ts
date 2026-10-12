@@ -4,8 +4,7 @@ import { CalendarApiError, isRateLimited } from './google/api';
 import { GoogleAuthError } from './google/oauth';
 import { clearRoundItems, openPerson, roundStatement, upsertPersonRow, type PersonRow } from './store';
 import { FEED, runUnit, SYNC, type RoundKind } from './round';
-import { overQuota } from './person';
-import { addWorkReads, pauseFirestore, FIRESTORE_PAUSE_MS, READ_BACKOFF_MS, ReadBudgetSpent, workGate } from './budget';
+import { firestoreQuota, FIRESTORE_PAUSE_MS, READ_BACKOFF_MS, ReadBudgetSpent, refusedBy, runBudget, untilNextDay } from './budget';
 import { zeroCounts, type SyncCounts } from './sync';
 
 export { dropFeed } from './store';
@@ -119,15 +118,18 @@ async function send(env: Env, pid: string): Promise<boolean> {
 export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promise<WorkOutcome> {
   const now = deps.now ?? Date.now();
   const handed = deps.handover;
-  // A chain starts only while Firestore has reads to give and the day's budget isn't spent; a unit
+  // The unit's reads: counted from each answer, capped at ROUND_READS, added to the day's work share.
+  const budget = runBudget(env, 'work', now);
+  // A chain starts only while Firestore has reads to give and the day's share isn't spent; a unit
   // handed on from one goes on (its round is bounded by ROUND_READS).
   if (!handed) {
-    const gate = await workGate(env, now);
+    const gate = await budget.begin();
     if (gate) {
+      const reason = gate.scope === 'paused' ? 'paused' : 'budget';
       // Spent: the person waits for the next day (the checks and the cron's sweep skip them till then).
-      if (gate.reason === 'budget') await env.DB.prepare('UPDATE people SET backoff_until = ? WHERE pid = ? AND (lease_until IS NULL OR lease_until <= ?)').bind(now + gate.wait, pid, now).run();
-      log('work', { ok: false, reason: gate.reason, reads: gate.reads });
-      return { retryAfter: Math.ceil(gate.wait / 1000), reason: gate.reason };
+      if (reason === 'budget') await env.DB.prepare('UPDATE people SET backoff_until = ? WHERE pid = ? AND (lease_until IS NULL OR lease_until <= ?)').bind(now + gate.wait, pid, now).run();
+      log('work', { ok: false, reason, reads: gate.reads });
+      return { retryAfter: Math.ceil(gate.wait / 1000), reason };
     }
   }
   // Handed the lease by the unit before (a read), or taking it (a write).
@@ -158,12 +160,11 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
   }
   const name = kind === SYNC ? 'sync' : 'feed';
   let unit: Awaited<ReturnType<typeof runUnit>>;
-  const reads = { n: 0 };
   try {
     const record = await openPerson(env, pid, held.record);
     unit =
       record && (kind === SYNC ? record.google : record.feed)
-        ? await runUnit(env, pid, kind, held, record, { ...deps, round: going && given ? given.round : undefined, reads })
+        ? await runUnit(env, pid, kind, held, record, { ...deps, round: going && given ? given.round : undefined, budget })
         : {
             // Nothing to do it for (the feed or Google is gone): the round goes too.
             done: true,
@@ -178,24 +179,32 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
             reads: 0,
           };
   } catch (e) {
-    const billed = reads.n ? [addWorkReads(env, now, reads.n)] : [];
-    if (e instanceof ReadBudgetSpent) {
+    await budget.finish();
+    const reads = budget.reads;
+    const by = refusedBy(e);
+    if (e instanceof ReadBudgetSpent || by === 'run') {
       // The round goes, and the person waits: whatever made it read this much would do it again at once.
+      const total = e instanceof ReadBudgetSpent ? e.reads : reads;
       await env.DB.batch([
-        ...billed,
         clearRoundItems(env, pid),
-        env.DB.prepare('UPDATE people SET lease_until = NULL, backoff_until = ?, round = NULL, round_kind = NULL, round_at = NULL, round_reads = ?, round_reads_at = ? WHERE pid = ?').bind(now + READ_BACKOFF_MS, e.reads, now, pid),
+        env.DB.prepare('UPDATE people SET lease_until = NULL, backoff_until = ?, round = NULL, round_kind = NULL, round_at = NULL, round_reads = ?, round_reads_at = ? WHERE pid = ?').bind(now + READ_BACKOFF_MS, total, now, pid),
       ]);
-      log('work', { kind: name, ok: false, reason: 'read-budget', reads: e.reads });
+      log('work', { kind: name, ok: false, reason: 'read-budget', reads: total });
       return { retryAfter: READ_BACKOFF_MS / 1000, reason: 'budget' };
     }
     // The round as the unit before left it: on the row, for whichever unit comes next.
-    const keep = [...billed, ...(given?.round ? [roundStatement(env, pid, { sealed: given.round, kind: given.kind, at: now })] : [])];
-    if (overQuota(e)) {
-      // The project's reads are used up: nothing more is asked of Firestore for a while, checks included.
-      await pauseFirestore(env, now);
+    const keep = given?.round ? [roundStatement(env, pid, { sealed: given.round, kind: given.kind, at: now })] : [];
+    if (by === 'work') {
+      // The day's work share ran out mid-round: the round stays on the row; the person waits for the next day.
+      const wait = untilNextDay(now);
+      await env.DB.batch([...keep, env.DB.prepare('UPDATE people SET lease_until = NULL, backoff_until = ? WHERE pid = ?').bind(now + wait, pid)]);
+      log('work', { kind: name, ok: false, reason: 'budget', reads });
+      return { retryAfter: Math.ceil(wait / 1000), reason: 'budget' };
+    }
+    if (firestoreQuota(e)) {
+      // The project's reads are used up: the budget paused checks and work (`firestore-pause`) when Firestore said so.
       await env.DB.batch([...keep, env.DB.prepare('UPDATE people SET lease_until = NULL WHERE pid = ?').bind(pid)]);
-      log('work', { kind: name, ok: false, reason: 'firestore-quota', reads: reads.n });
+      log('work', { kind: name, ok: false, reason: 'firestore-quota', reads });
       return { retryAfter: FIRESTORE_PAUSE_MS / 1000, reason: 'paused' };
     }
     if (isRateLimited(e)) return backOff(env, pid, held, now, name, keep);
@@ -207,10 +216,10 @@ export async function runWork(env: Env, pid: string, deps: WorkDeps = {}): Promi
         ? env.DB.prepare('UPDATE people SET lease_until = NULL, last_sync = ?, last_error = ? WHERE pid = ?').bind(now, reason, pid)
         : env.DB.prepare('UPDATE people SET lease_until = NULL WHERE pid = ?').bind(pid),
     ]);
-    log('work', { kind: name, ok: false, reason, reads: reads.n });
+    log('work', { kind: name, ok: false, reason, reads });
     return { retryAfter: 60, reason: 'error' };
   }
-  if (unit.reads) unit.statements.push(addWorkReads(env, now, unit.reads));
+  await budget.finish();
   const round = { round: unit.round, kind: unit.round ? kind : null, at: unit.round ? unit.started : null };
   if (unit.limited) return backOff(env, pid, held, now, name, [...unit.statements, roundStatement(env, pid, unit.round ? { sealed: unit.round, kind, at: unit.started } : null)]);
   const depth = (handed?.depth ?? 0) + 1;
@@ -296,7 +305,9 @@ export async function runRound(env: Env, pid: string, kind: RoundKind, deps: Omi
       if (kind === SYNC) await upsertPersonRow(env, pid, { google: 0 }, now);
       return null;
     }
-    const unit = await runUnit(env, pid, kind, row, record, deps);
+    // Counted against the day's work share like the Worker's own units.
+    const budget = runBudget(env, 'work', now);
+    const unit = await budget.within(() => runUnit(env, pid, kind, row, record, { ...deps, budget }));
     await env.DB.batch([
       ...unit.statements,
       env.DB.prepare('UPDATE people SET work = work & ~? WHERE pid = ?').bind(unit.finished, pid),
