@@ -76,6 +76,9 @@ CALENDAR_NAME = "Huishouden"
 # Firestore reads a day the checks may use, of the free plan's 50,000 shared with every app
 # (README, "Many households"). They check less often rather than go over it.
 FIRESTORE_CHECK_READS = "20000"
+# Firestore reads a day the work (feed builds, sync rounds) may use (src/budget.ts); a round alone at
+# most 2,500 (src/round.ts ROUND_READS). Checks and work together stay under 30,000.
+FIRESTORE_WORK_READS = "10000"
 
 [env.staging]
 name = "huishouden-calendar-staging"
@@ -126,3 +129,4 @@ GOOGLE_REDIRECT_URIS = "https://huishouden-staging.web.app/my-calendar https://h
 CALENDAR_NAME = "Huishouden (staging)"
 # Staging's reads mostly go to the apps' CI.
 FIRESTORE_CHECK_READS = "5000"
+FIRESTORE_WORK_READS = "5000"

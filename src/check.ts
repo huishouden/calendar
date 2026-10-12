@@ -8,6 +8,7 @@ import { Calendar, CalendarApiError, isRateLimited, SyncTokenGone } from './goog
 import { eventRows, openPerson, savePerson, sealCounts, upsertPersonRow, type PersonRecord, type PersonRow } from './store';
 import { FULL_EVERY_MS, isEcho } from './sync';
 import { dropFeed, markWork } from './work';
+import { pauseFirestore } from './budget';
 import { FEED, SYNC } from './round';
 
 /**
@@ -27,8 +28,6 @@ import { FEED, SYNC } from './round';
 export const SUBREQUESTS = 50;
 /** The most one person's check can take: token, change list, Google token, batchGet, four aggregations. */
 const PERSON_MAX = 8;
-/** Firestore over its quota: no checks for this long (the cron reads the pause from `meta`). */
-export const FIRESTORE_PAUSE_MS = 15 * 60_000;
 
 export interface CheckDeps {
   fetch?: Fetch;
@@ -116,7 +115,7 @@ export async function checkPeople(env: Env, pids: string[], deps: CheckDeps = {}
       }
     } catch (e) {
       if (overQuota(e)) {
-        await env.DB.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind('firestore-pause', now + FIRESTORE_PAUSE_MS).run();
+        await pauseFirestore(env, now);
         totals.paused = true;
         log('check', { paused: 'firestore-quota' });
         break;

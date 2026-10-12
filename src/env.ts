@@ -30,6 +30,11 @@ export interface Env {
    * rather than go over it. Unset: no limit (a project on the Blaze plan).
    */
   FIRESTORE_CHECK_READS?: string;
+  /**
+   * Firestore reads a day the work (feed builds and sync rounds) may use (src/budget.ts): past it,
+   * work waits for the next day (midnight Pacific). Unset: no limit.
+   */
+  FIRESTORE_WORK_READS?: string;
   /** Extra roots for the minute's checks (src/ticker.ts): each Ticker's alarm is its own top-level invocation. */
   TICKER?: DurableObjectNamespace<TickerRpc>;
   /** Firestore's REST base, for the emulator in tests and `wrangler dev`; production leaves it out. */

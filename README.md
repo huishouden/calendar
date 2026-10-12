@@ -52,6 +52,7 @@ location (`LOCATION` in the feed, `location` in Google).
 | `src/tick.ts` | The cron: who is due this minute, checked a few at a time in their own invocations |
 | `src/check.ts` | The cheap check for a few people: did anything they see change? Marks and queues the work |
 | `src/work.ts` | One unit of a person's work per invocation, the next one handed the lease and the round straight after. Lease, back-off |
+| `src/budget.ts` | The work's Firestore reads: the day's count and budget (`FIRESTORE_WORK_READS`), the pause when Firestore's quota is used up |
 | `src/round.ts` | A feed build or a sync round in units of at most 6 subrequests and 60 items: its steps, and what one unit hands the next |
 | `src/person.ts` | Acting as the person: their ID token on every Firestore call, their role and settings, the change signal |
 | `src/sync.ts` | What a person's Google sync writes: echoes of our own writes, the writes and rows for each event |
@@ -426,13 +427,23 @@ limit is the binding one: 100 accounts while the app is unverified.
   changed, or once a day. When the project's daily quota is used up (Spark: 50,000
   reads), Firestore answers 429 until midnight Pacific time: the portal's calls get 503
   `firestore-quota` (the portal says so, rather than "couldn't reach"), feeds serve what is stored,
-  and the checks pause.
+  and the checks and the work pause for 15 minutes at a time.
+- **The work's reads are bounded** (`src/budget.ts`, `src/round.ts`). A feed build or a sync round
+  may be billed for at most 2,500 reads (`ROUND_READS`, 5% of the free 50,000); past it the round is
+  dropped and the person waits an hour, with a `"reason":"read-budget"` line. All the work together may use
+  `FIRESTORE_WORK_READS` a day (10,000; staging 5,000), counted per quota day (midnight Pacific) in
+  D1's `meta`; past it, work waits for the next day. With the checks' 20,000 that keeps the Worker
+  under 30,000 of the project's 50,000. Each unit logs what it was billed for (`"event":"work"`,
+  `reads`), and each finished round its total (`"event":"round"`, `kind`, `reads`); the logs name no
+  one. Whose round it was is in D1: each person's last round's reads are on their row
+  (`SELECT pid, round_reads, round_reads_at FROM people ORDER BY round_reads DESC`).
 - **CPU**: the free plan allows 10 ms per invocation. A feed request serves what is stored, at
   1 to 2 ms. A check is 2 people. A feed build or a sync round is a chain of units
   (`src/round.ts`), each its own invocation with at most 6 subrequests (about 1 ms of CPU each) and
   at most 60 items exported or 10 Google writes, and the cold start (language catalogues, the
   runtime's time zone data) happens once per isolate at startup (`src/warm.ts`), which Cloudflare
-  limits separately. Each unit logs its steps and subrequests (`"event":"work"`, `step`, `calls`).
+  limits separately. Each unit logs its steps, subrequests and Firestore reads (`"event":"work"`,
+  `step`, `calls`, `reads`).
   Some portal calls still measure 8 to 16 ms (below). Workers Paid ($5 a month) raises the limit
   to 30 seconds.
 - **Ahead of the window**: apps publish 180 days ahead (Home's regular events 60). A repeating event

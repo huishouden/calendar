@@ -154,6 +154,9 @@ export interface PersonRow {
   round: string | null;
   round_kind: number | null;
   round_at: number | null;
+  /** Firestore reads the last finished or stopped round was billed for, and when (src/budget.ts). */
+  round_reads: number | null;
+  round_reads_at: number | null;
   /** The household's shared lists' counts the last check that marked work asked (`HouseholdCounts`), sealed for `counts:<pid>`. */
   hh_counts: string | null;
 }

@@ -40,6 +40,43 @@ export const forgetTokens = () => caches.clear();
 /** The person is no longer in the household, or never was. */
 export class NotMember extends Error {}
 
+/** Firestore reads billed so far, counted by the `Person` (or `Person`s) sharing it. */
+export interface ReadCount {
+  n: number;
+}
+
+/**
+ * Firestore over REST, counting the reads it is billed for: each document a query returns and at
+ * least one per query, one per 1,000 index entries an aggregation counts, each document a get asks
+ * for, found or not.
+ */
+class CountingFirestore extends FirestoreRest {
+  constructor(
+    options: ConstructorParameters<typeof FirestoreRest>[0],
+    readonly reads: ReadCount,
+  ) {
+    super(options);
+  }
+
+  override async get(path: string) {
+    const doc = await super.get(path);
+    this.reads.n += 1;
+    return doc;
+  }
+
+  override async query(...args: Parameters<FirestoreRest['query']>) {
+    const docs = await super.query(...args);
+    this.reads.n += Math.max(1, docs.length);
+    return docs;
+  }
+
+  override async aggregate(...args: Parameters<FirestoreRest['aggregate']>) {
+    const result = await super.aggregate(...args);
+    this.reads.n += Math.max(1, Math.ceil(result.count / 1000));
+    return result;
+  }
+}
+
 export interface View {
   household: string;
   email: string;
@@ -110,17 +147,22 @@ export class Person {
     readonly record: Pick<PersonRecord, 'household' | 'email' | 'refreshToken'>,
     fetchImpl?: Fetch,
     firestoreUrl?: string,
+    /** Where the reads this person's calls are billed for are counted (a round's, src/round.ts). */
+    readonly reads: ReadCount = { n: 0 },
   ) {
     const cache = tokenCache(env, fetchImpl);
     this.token = async () => (await cache.get(record.refreshToken)).token;
     this.fetchImpl = fetchImpl ?? ((url, init) => fetch(url, init));
     this.firestoreUrl = (firestoreUrl ?? env.FIRESTORE_URL ?? 'https://firestore.googleapis.com/v1').replace(/\/$/, '');
-    this.db = new FirestoreRest({
-      projectId: env.FIREBASE_PROJECT_ID,
-      token: this.token,
-      ...(fetchImpl ? { fetch: fetchImpl } : {}),
-      ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}),
-    });
+    this.db = new CountingFirestore(
+      {
+        projectId: env.FIREBASE_PROJECT_ID,
+        token: this.token,
+        ...(fetchImpl ? { fetch: fetchImpl } : {}),
+        ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}),
+      },
+      reads,
+    );
     this.base = `households/${record.household}`;
   }
 
@@ -140,6 +182,7 @@ export class Person {
       throw new FirestoreError('unavailable', 'Firestore unreachable');
     }
     const parsed = (await res.json().catch(() => null)) as unknown;
+    if (res.ok) this.reads.n += paths.length;
     if (!res.ok || !Array.isArray(parsed)) {
       const error = (Array.isArray(parsed) ? parsed[0] : parsed) as { error?: { status?: string } } | null;
       const status = error?.error?.status ?? '';

@@ -7,8 +7,9 @@ import type { Doc } from '@huishouden/pwa-kit/firestore-rest';
 import { LocalClock } from '@huishouden/pwa-kit/local-clock';
 import { globalFetch, type Env, type Fetch } from './env';
 import { log } from './log';
-import { langOf, loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type View } from './person';
-import { readLists, type Tally } from './lists';
+import { langOf, loadedFrom, NotMember, Person, signalExtra, signalFrom, signInGone, zoneOf, type Loaded, type ReadCount, type View } from './person';
+import { readLists, tallyOf, type Tally } from './lists';
+import { ReadBudgetSpent, roundOverBudget } from './budget';
 import { seal, unseal } from './seal';
 import { accessToken, GoogleAuthError } from './google/oauth';
 import { Calendar, CalendarApiError, rateLimited, reasonOf, SyncTokenGone, type BatchRequest, type GoogleEvent } from './google/api';
@@ -44,6 +45,7 @@ import { FULL_EVERY_MS, isEcho, MAX_WRITES, parseOverrides, planWrites, zeroCoun
 export const UNIT_CALLS = 6;
 /** A round not finished in this long starts again (what it planned is out of date). */
 export const ROUND_MAX_MS = 30 * 60_000;
+
 /** Writes (and rows) kept on the person's row while they are this few; more go to `round_items`. */
 const ROW_WRITES = 20;
 
@@ -115,6 +117,8 @@ export interface RoundState {
   witness: ExportEvent[];
   events: number;
   counts: SyncCounts;
+  /** Firestore reads the round has been billed for so far, all its units (ROUND_READS). */
+  billed: number;
 }
 
 export interface UnitResult {
@@ -133,6 +137,8 @@ export interface UnitResult {
   counts: SyncCounts;
   /** Subrequests the unit made (Firestore, Google, D1), for the log. */
   calls: number;
+  /** Firestore reads the unit was billed for. */
+  reads: number;
 }
 
 export interface RoundDeps {
@@ -141,6 +147,8 @@ export interface RoundDeps {
   firestoreUrl?: string;
   /** The round as the unit before handed it over (sealed), when it came straight from that unit. */
   round?: string | null;
+  /** Counts the Firestore reads the unit is billed for, also when it throws. */
+  reads?: ReadCount;
 }
 
 
@@ -170,6 +178,7 @@ function fresh(kind: RoundKind, now: number, row: PersonRow, record: PersonRecor
     witness: [],
     events: 0,
     counts: zeroCounts(),
+    billed: 0,
   };
 }
 
@@ -220,6 +229,7 @@ interface Ctx {
   firestoreUrl?: string;
   statements: D1PreparedStatement[];
   calls: { n: number };
+  reads: ReadCount;
   limited: boolean;
   memo: Memo;
 }
@@ -260,17 +270,28 @@ export async function runUnit(env: Env, pid: string, kind: RoundKind, row: Perso
     if (row.round || deps.round) statements.push(clearRoundItems(env, pid));
     state = fresh(kind, now, row, record);
   }
-  const ctx: Ctx = { env: cenv, pid, row, record, state, now, fetch: fetchImpl, firestoreUrl: deps.firestoreUrl, statements, calls, limited: false, memo: {} };
+  const reads = deps.reads ?? { n: 0 };
+  const before = reads.n;
+  const billed = state.billed;
+  const ctx: Ctx = { env: cenv, pid, row, record, state, now, fetch: fetchImpl, firestoreUrl: deps.firestoreUrl, statements, calls, reads, limited: false, memo: {} };
   const ran: Step[] = [];
   let next: Next;
   for (;;) {
     ran.push(state.step);
     next = await STEPS[state.step](ctx);
+    // Checked after every step: a round that keeps reading stops here, whatever the reason.
+    state.billed = billed + reads.n - before;
+    if (roundOverBudget(state.billed)) throw new ReadBudgetSpent(state.billed);
     if (next === 'chain') continue;
     if (next !== 'continue' || ctx.limited || calls.n + stepCalls(ctx) > UNIT_CALLS) break;
   }
   const done = next === 'done';
   if (done && state.items) statements.push(clearRoundItems(env, pid));
+  // What each finished round was billed for: in the log (no one named), and on the person's row.
+  if (done) {
+    log('round', { kind: kind === SYNC ? 'sync' : 'feed', reads: state.billed });
+    statements.push(env.DB.prepare('UPDATE people SET round_reads = ?, round_reads_at = ? WHERE pid = ?').bind(state.billed, now, pid));
+  }
   return {
     done,
     step: ran.join('+'),
@@ -281,6 +302,7 @@ export async function runUnit(env: Env, pid: string, kind: RoundKind, row: Perso
     finished: done ? kind | (state.feed ? FEED : 0) : 0,
     counts: state.counts,
     calls: calls.n,
+    reads: reads.n - before,
   };
 }
 
@@ -295,7 +317,7 @@ const STEPS: Record<Step, (ctx: Ctx) => Promise<Next>> = {
   write: writeStep,
 };
 
-const person = (ctx: Ctx) => new Person(ctx.env, ctx.record, ctx.fetch, ctx.firestoreUrl);
+const person = (ctx: Ctx) => new Person(ctx.env, ctx.record, ctx.fetch, ctx.firestoreUrl, ctx.reads);
 
 const isSync = (ctx: Ctx) => ctx.state.kind === SYNC;
 /** Whether the round builds the feed: a feed round, or a sync round that does both. */
@@ -335,9 +357,9 @@ async function handedOn(ctx: Ctx, part: Part): Promise<string[]> {
 
 const opened = <T>(ctx: Ctx, sealed: string | undefined): Promise<T | null> => unseal<T>(ctx.env.SEAL_KEY, purpose(ctx.pid), sealed ?? null);
 
-/** The round from the top: something it handed on is gone (another round replaced it). */
+/** The round from the top: something it handed on is gone (another round replaced it). Its reads still count. */
 function restart(ctx: Ctx): Next {
-  Object.assign(ctx.state, fresh(ctx.state.kind, ctx.now, ctx.row, ctx.record));
+  Object.assign(ctx.state, fresh(ctx.state.kind, ctx.now, ctx.row, ctx.record), { billed: ctx.state.billed });
   ctx.statements.push(clearRoundItems(ctx.env, ctx.pid));
   return 'yield';
 }
@@ -445,6 +467,11 @@ async function listsStep(ctx: Ctx): Promise<Next> {
   const { state } = ctx;
   const read = (await loadLists(ctx))!;
   read.specs.forEach((s, i) => (state.reads[s.collection] = read.outcomes[i]));
+  // The lists as read are what the round works from: their counts replace the ones the `view` step
+  // asked (or the check's), which a write since has made stale. Otherwise the copies just kept could
+  // never match them, and `split` would send the round back here for ever, reading every list whole
+  // each time (the incident of 2026-10-12: 39,000 reads in 22 minutes).
+  read.specs.forEach((s, i) => (state.tallies![s.slot] = tallyOf(read.docs[i])));
   state.step = 'split';
   // Small lists all as kept: the split in this unit. Otherwise reading (and keeping) them was a
   // unit's work: the split reads the kept copies in the next.
