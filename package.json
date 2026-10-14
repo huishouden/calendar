@@ -15,7 +15,7 @@
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
-    "@huishouden/pwa-kit": "https://github.com/huishouden/pwa-kit/releases/download/v0.118.0/pwa-kit-0.118.0.tgz"
+    "@huishouden/pwa-kit": "https://github.com/huishouden/pwa-kit/releases/download/v0.123.0/pwa-kit-0.123.0.tgz"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261002.1",
