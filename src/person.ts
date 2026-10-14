@@ -1,4 +1,4 @@
-import { exchangeRefreshToken, FirebaseAuthError, IdTokenCache, type AuthRestOptions } from '@huishouden/pwa-kit/firebase-auth-rest';
+import { exchangeRefreshToken, FirebaseAuthError, IdTokenCache, jwtClaims, type AuthRestOptions } from '@huishouden/pwa-kit/firebase-auth-rest';
 import { decodeFields, FirestoreError, FirestoreRest, type Doc, type FieldFilter } from '@huishouden/pwa-kit/firestore-rest';
 import type { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { PERSONAL_AGENDA, toAgendaItem, type AgendaItem } from '@huishouden/pwa-kit/agenda-core';
@@ -345,3 +345,19 @@ export const signalFrom = (view: View, tallies: Tally[], extra: string): string 
 
 /** Whether an error means the person's sign-in is gone for good (signed out everywhere, account disabled). */
 export const signInGone = (e: unknown): boolean => e instanceof FirebaseAuthError && e.kind === 'revoked';
+
+/** The token's person (uid, verified email) if its claims are for this project and unexpired; null otherwise. */
+export function claimedPerson(env: Pick<Env, 'FIREBASE_PROJECT_ID'>, idToken: string, now = Date.now()): { uid: string; email: string } | null {
+  let claims: Record<string, unknown>;
+  try {
+    claims = jwtClaims(idToken);
+  } catch {
+    return null;
+  }
+  if (claims.aud !== env.FIREBASE_PROJECT_ID || claims.iss !== `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) return null;
+  if (typeof claims.exp !== 'number' || claims.exp * 1000 <= now) return null;
+  const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
+  const uid = typeof claims.user_id === 'string' ? claims.user_id : typeof claims.sub === 'string' ? claims.sub : '';
+  if (!email || !uid || claims.email_verified !== true) return null;
+  return { uid, email };
+}

@@ -43,6 +43,14 @@ export interface Env {
   FIRESTORE_MAIL_READS?: string;
   /** Extra roots for the minute's checks (src/ticker.ts): each Ticker's alarm is its own top-level invocation. */
   TICKER?: DurableObjectNamespace<TickerRpc>;
+  /** Workers AI (wrangler.toml `[ai]`): Add by photo's model (src/photo.ts). Without it, `/api/photo/products` answers 501. */
+  AI?: Ai;
+  /** Photos a household may have read a UTC day (src/photo.ts). Digits only. */
+  PHOTO_HOUSEHOLD_DAILY?: string;
+  /** Photos everyone together may have read a UTC day, well under Workers AI's free allocation. Digits only. */
+  PHOTO_DAILY?: string;
+  /** Neurons a UTC day after which no photo is sent (the free allocation is 10,000). Digits only. */
+  PHOTO_DAILY_NEURONS?: string;
   /** Firestore's REST base, for the emulator in tests and `wrangler dev`; production leaves it out. */
   FIRESTORE_URL?: string;
 }
@@ -65,6 +73,8 @@ export interface FanoutRpc {
   /** Spending's alert inboxes: a few checked (src/mail/check.ts), and one unit of an inbox's import (src/mail/work.ts). */
   mail(ids: string[]): Promise<import('./mail/check').MailTotals>;
   mailWork(id: string): Promise<import('./work').WorkOutcome>;
+  /** Add by photo: one photo through the model, in its own invocation (src/photo.ts). */
+  photo(dataUrl: string, categories: string[]): Promise<import('./photo').OnePhoto>;
 }
 
 /** A Ticker Durable Object (src/ticker.ts): told its part, it checks that share of every minute from its alarm. */

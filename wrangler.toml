@@ -57,6 +57,10 @@ binding = "SELF"
 service = "huishouden-calendar"
 entrypoint = "Fanout"
 
+# Workers AI: Add by photo's vision model (src/photo.ts), on the free daily allocation only.
+[ai]
+binding = "AI"
+
 # Public values. Secrets are set with `bunx wrangler secret put`, never written here:
 #   SEAL_KEY              32 random bytes, base64 (`bun run seal-key`): seals tokens in KV
 #   GOOGLE_CLIENT_SECRET  the web OAuth client's secret (README, "Google Calendar sync")
@@ -80,6 +84,12 @@ CALENDAR_NAME = "Huishouden"
 FIRESTORE_CHECK_READS = "12000"
 FIRESTORE_WORK_READS = "6000"
 FIRESTORE_MAIL_READS = "2000"
+# Add by photo (src/photo.ts, README "Add by photo"), per UTC day: photos a household may have read,
+# photos everyone together may (about 28 neurons each, measured), and the measured neurons after
+# which none is sent, all well under Workers AI's free 10,000 a day. Digits only.
+PHOTO_HOUSEHOLD_DAILY = "25"
+PHOTO_DAILY = "150"
+PHOTO_DAILY_NEURONS = "6000"
 
 [env.staging]
 name = "huishouden-calendar-staging"
@@ -111,6 +121,9 @@ binding = "SELF"
 service = "huishouden-calendar-staging"
 entrypoint = "Fanout"
 
+[env.staging.ai]
+binding = "AI"
+
 [[env.staging.kv_namespaces]]
 binding = "TOKENS"
 id = "746ffd1dbaa74793bf6a00e8e90c278a"
@@ -125,10 +138,14 @@ migrations_dir = "migrations"
 FIREBASE_PROJECT_ID = "huishouden-staging"
 GOOGLE_CLIENT_ID = "212329703141-k8rtusehnq9a7c7okd3e6c8md99u7gj2.apps.googleusercontent.com"
 SITE_URL = "https://huishouden-staging.web.app"
-ALLOWED_ORIGINS = "https://huishouden-staging.web.app http://localhost:5173 http://127.0.0.1:5173"
+ALLOWED_ORIGINS = "https://huishouden-staging.web.app https://huishouden-staging-groceries.web.app http://localhost:5173 http://127.0.0.1:5173"
 GOOGLE_REDIRECT_URIS = "https://huishouden-staging.web.app/my-calendar https://huishouden-staging.web.app/spending/"
 CALENDAR_NAME = "Huishouden (staging)"
 # Staging's reads mostly go to the apps' CI.
 FIRESTORE_CHECK_READS = "5000"
 FIRESTORE_WORK_READS = "5000"
 FIRESTORE_MAIL_READS = "1000"
+# Staging shares the account's free Workers AI allocation with production: fewer photos.
+PHOTO_HOUSEHOLD_DAILY = "25"
+PHOTO_DAILY = "60"
+PHOTO_DAILY_NEURONS = "2000"

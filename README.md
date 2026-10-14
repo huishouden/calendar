@@ -15,6 +15,10 @@ It also checks **Spending's alert inboxes**: Gmail accounts a member connected i
 (Settings > Email) so the household's card-alert emails become transactions within about 5
 minutes, with no app open ("Spending's alert inboxes" below).
 
+And it reads **product names from photos** for Groceries' Add by photo: a member snaps what is
+running low, a vision model on Workers AI reads the packages, and the app shows them as a checklist
+to confirm ("Add by photo" below).
+
 What a person sees is what they may see in the household, in their language, with their settings.
 Their language is the one they set in the apps (`households/{id}.langs`, read with the household),
 else the one their device had when they set the calendar up; each item's `texts` in it, else the
@@ -418,6 +422,71 @@ minutes to move the history id; "Updated ... ago" comes from one row per minute 
 10,000 D1 rows written, and Firestore reads only for imports (a handful per alert). Google's own
 limit is the binding one: 100 accounts while the app is unverified.
 
+## Add by photo
+
+`POST /api/photo/products` (src/photo.ts): Groceries sends one photo a request (three in flight at
+most), already made small on the phone (768 pixels on the long side, JPEG; pwa-kit `shrinkPhoto`),
+with the household and its aisle sections. The Worker asks a vision model on Workers AI which
+products it shows and answers with their names as printed and a section from the app's list. The
+app shows them as a checklist; nothing is added until the person taps "Add N items". Photos with a
+barcode the phone can read never come here: the app looks the number up in Open Food Facts.
+
+**Privacy.** The photo goes to the model once and is kept nowhere: no storage, and the log line
+has counts only (photos, products, neurons, the model, whether the member check was remembered),
+never the photo, a name read from it, the household or the person. Cloudflare does not train
+models on Workers AI inputs. The portal's privacy page says so in every language.
+
+**Who.** A member of the household, any role: the household read as them (Firestore checks the
+token, the rules refuse anyone else), then remembered for an hour in D1 (`photo-member:<hash>`),
+with the token checked by Firebase Auth meanwhile. A session of photos costs one Firestore read.
+
+**The model.** `@cf/mistralai/mistral-small-3.1-24b-instruct` with a JSON schema for the answer
+(the sections as an enum); `@cf/meta/llama-4-scout-17b-16e-instruct` once if it fails. Compared on
+the invented photos in huishouden/groceries `e2e/fixtures/photos/`, 2026-10-14:
+
+| Model | Neurons a photo | Names | Note |
+|---|---|---|---|
+| Mistral Small 3.1 24B | 27 to 30 | as printed, "creamer" kept | chosen |
+| Llama 4 Scout 17B | 32 to 35 | drops the product word ("Coffee mate Italian Sweet Crème"), copies capitals | the fallback |
+| Llama 3.2 11B Vision | (about 15, from its price) | not tried | needs a licence agreement for the account, which excludes EU-domiciled users: not for a product for anyone |
+| Gemma 3 12B | | | not available to this account |
+| Moondream 3.1 | | empty answers | |
+
+**Measured on staging** (`scripts/photo-probe.ts` in huishouden/groceries; `neurons` is Workers
+AI's own `usage.neurons`, logged per request):
+
+| Photo (invented) | Products read | Neurons |
+|---|---|---|
+| A creamer bottle | Coffee mate Italian Sweet Crème creamer, Zero Sugar | 28.1 |
+| A whipped cream can | Reddi-wip Original whipped topping, made with real cream | 28.1 |
+| Both | the two | 29.3 |
+| Spaghetti, ketchup, whipped cream | Barilla Spaghetti n.5, Heinz Tomato Ketchup, Reddi-wip Original Whipped Topping Made With Real Cream | 30.2 |
+| A jar (with its barcode; the app reads that first) | nutella Hazelnut Spread with Cocoa | 28.0 |
+
+The cost is almost all the image (about 800 tokens at 768 pixels, whatever is in it); each product
+read adds about 1 neuron. At 28.7 a photo, the free 10,000 neurons are about 350 photos a day.
+
+**Caps** (wrangler.toml, per UTC day, when Workers AI's allocation starts again; counted in D1
+`meta`):
+
+| | Production | Staging |
+|---|---|---|
+| Photos a household (`PHOTO_HOUSEHOLD_DAILY`) | 25 | 25 |
+| Photos everyone together (`PHOTO_DAILY`) | 150 (about 4,300 neurons) | 60 (about 1,700) |
+| Neurons after which none is sent (`PHOTO_DAILY_NEURONS`) | 6,000 | 2,000 |
+
+Production and staging share the account's one free allocation: their ceilings together are 8,000
+of the 10,000. A photo is counted once read (one the model couldn't read costs nothing), so a burst
+can pass a cap by the photos in flight, three at most a household. When Workers AI says the
+allocation is used up (error 4006), everyone is capped until the next UTC day. A capped answer says
+whose cap (`household` or `everyone`), and the app offers typing instead.
+
+**CPU.** Handing a photo to Workers AI costs the invocation a few milliseconds, so each photo goes
+through `SELF.photo` (the Fanout entrypoint), its own invocation, and a request carries one photo
+(three in one request measured 14 to 18 ms). The request itself makes four subrequests: D1 (the
+remembered member check and the day's counts in one batch), Firebase Auth or the household read,
+the photo's invocation, D1 (the counts kept).
+
 ## Limits
 
 - **Subscribed feeds refresh slowly in Google Calendar.** Google re-reads a subscribed URL on its
@@ -503,6 +572,9 @@ rotate, revoke) and the minute ticks. Warm means the isolate had served a reques
 | Cron tick, nobody due | 3 to 4 D1 | 2 to 6 |
 | Check, one feed-only person | batchGet, 2 to 4 aggregations, a token, 2 D1 | 7 to 8 |
 | Feed build (its own invocation; queue or `SELF.work`), 1 to 3 events | lease, batchGet, 4 queries, 2 D1 | 10 to 18 |
+| Add by photo, 48 to 57 KB photo, member read (14 October 2026) | 2 D1 batches, household read, `SELF.photo` | 4 to 8 (15 in a fresh isolate) |
+| Add by photo, member remembered | 2 D1 batches, accounts:lookup, `SELF.photo` | 3 to 7 |
+| `SELF.photo` (the model call) | Workers AI | 0 to 5 |
 | Production: check of one person with Google (63 events), every 5 minutes, 9:00 to 9:30 UTC | Google token, change list, batchGet, 2 to 4 aggregations, 1 to 2 D1 | 2 to 15, typically 5 |
 | Production: sync round, 63 events, fresh queue isolate (before #30 and #34) | ~16 | 34 to 83 |
 | Production: the next round in the same isolate (before #30 and #34) | ~16 | 36 |
@@ -600,7 +672,14 @@ variables on huishouden/spending as on the portal.
 ### The portal
 
 The portal calls this Worker at `VITE_CALENDAR_URL` (production) and `STAGING_VITE_CALENDAR_URL`
-(staging), which are repository variables on huishouden/portal.
+(staging), which are repository variables on huishouden/portal; so do Spending (alert inboxes) and
+Groceries (Add by photo), with the same variables on their repos. Groceries' staging site,
+`https://huishouden-staging-groceries.web.app`, is in staging's `ALLOWED_ORIGINS`.
+
+### Add by photo
+
+Nothing to set up: the `[ai]` binding uses the account's Workers AI free allocation (no paid plan,
+no API token in the Worker).
 
 ### Deploy
 

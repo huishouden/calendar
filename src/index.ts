@@ -9,6 +9,7 @@ import { checkInboxes, runMailCron, type MailTotals } from './mail/check';
 import { runMailWork } from './mail/work';
 import { runWork, type Handover, type WorkMessage, type WorkOutcome } from './work';
 import { warm } from './warm';
+import { readOnePhoto, type OnePhoto } from './photo';
 
 export { Ticker } from './ticker';
 
@@ -37,6 +38,10 @@ export class Fanout extends WorkerEntrypoint<Env> implements FanoutRpc {
 
   async mailWork(id: string): Promise<WorkOutcome> {
     return runMailWork(this.env, id, { next: (i) => this.env.SELF!.mailWork(i) });
+  }
+
+  async photo(dataUrl: string, categories: string[]): Promise<OnePhoto> {
+    return readOnePhoto(this.env, dataUrl, categories);
   }
 }
 
