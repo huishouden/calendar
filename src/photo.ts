@@ -1,11 +1,10 @@
 import { FirebaseAuthError, verifyIdToken } from '@huishouden/pwa-kit/firebase-auth-rest';
-import { FirestoreError, FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
 import { checkProductPhotoRequest, cleanProducts, productPrompt, type FoundProduct, type PhotoAnswer, type ProductPhotoResponse } from '@huishouden/pwa-kit/product-photo-core';
 import { sha256 } from './b64';
-import { requestBudget } from './budget';
+import { firestoreQuota, refusedBy, requestBudget } from './budget';
 import type { Env, Fetch } from './env';
 import { log } from './log';
-import { authOptions, claimedPerson } from './person';
+import { authOptions, claimedPerson, HouseholdRefusal, memberHousehold } from './person';
 import { householdKey } from './store';
 
 /**
@@ -15,9 +14,12 @@ import { householdKey } from './store';
  * has counts only, never a photo, a name read from one, a household or a person.
  *
  * Who: the caller's Firebase ID token and their membership of the household, read from Firestore
- * as them (Firestore checks the token; the rules refuse anyone else), then remembered for an hour in
- * D1 (`photo-member:<hash>`, the token then checked by Firebase Auth), so a session of photos costs
- * one Firestore read, not one a photo.
+ * as them (`memberHousehold`, as every portal call: Firestore checks the token; the rules refuse
+ * anyone else), then remembered for MEMBER_TTL_MS in D1 (`photo-member:<hash>`, the token checked
+ * by Firebase Auth meanwhile). A session of photos then costs one Firestore read when its photos
+ * wait for the first answer (pwa-kit `readProductPhotos` sends the first alone); requests sent
+ * before any answer each read once. Someone removed from the household can still spend its photos
+ * (never read its data) until their remembered check expires.
  *
  * Free: Workers AI's daily allocation (10,000 neurons on the Free plan, reset at 00:00 UTC) is the
  * only cost. Photos read are counted in D1's `meta` per UTC day, and a request is refused once a
@@ -28,6 +30,7 @@ import { householdKey } from './store';
  * | `photo:<day>:<household hash>` | `PHOTO_HOUSEHOLD_DAILY` photos |
  * | `photo:<day>` | `PHOTO_DAILY` photos, everyone together |
  * | `photo-neurons:<day>` | `PHOTO_DAILY_NEURONS`: the day's measured neurons, after which no photo is sent |
+ * | `photo-allocation:<day>` | 1 once Workers AI said its free allocation is used up (error 4006) |
  *
  * A photo is counted once read, so one the model couldn't read costs nothing, and a burst can pass
  * a cap by the photos already in flight (the app sends at most three at a time). When Workers AI
@@ -48,8 +51,8 @@ const RATES: Record<string, [number, number]> = {
 /** Longest answer asked for: a dozen products. */
 const MAX_TOKENS = 400;
 
-/** How long a member's check is remembered. */
-export const MEMBER_TTL_MS = 60 * 60_000;
+/** How long a member's check is remembered: a session of photos, and how long someone removed can still spend the household's. */
+export const MEMBER_TTL_MS = 10 * 60_000;
 
 export class PhotoHttpError extends Error {
   constructor(
@@ -121,6 +124,22 @@ export interface PhotoDeps {
   firestoreUrl?: string;
 }
 
+/** The day's counts, as read from D1. */
+export interface PhotoDay {
+  household: number;
+  everyone: number;
+  neurons: number;
+  /** Workers AI said its allocation is used up today. */
+  allocation: boolean;
+}
+
+/** Whose cap stops a photo today, or null when it may be read. */
+export function photoCapped(day: PhotoDay, caps: { household: number; everyone: number; neurons: number }): 'household' | 'everyone' | null {
+  if (day.allocation || day.everyone >= caps.everyone || day.neurons >= caps.neurons) return 'everyone';
+  if (day.household >= caps.household) return 'household';
+  return null;
+}
+
 const add = (env: Env, key: string, n: number) => env.DB.prepare('INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = value + ?2').bind(key, n);
 const valueOf = (env: Env, key: string) => env.DB.prepare('SELECT value FROM meta WHERE key = ?1').bind(key);
 
@@ -151,10 +170,11 @@ export async function photoRequest(env: Env, request: Request, body: Record<stri
     household: `photo:${day}:${await householdKey(checked.household)}`,
     everyone: `photo:${day}`,
     neurons: `photo-neurons:${day}`,
+    allocation: `photo-allocation:${day}`,
   };
-  const [until, household, everyone, neuronsToday] = (await env.DB.batch<{ value: number }>([keys.member, keys.household, keys.everyone, keys.neurons].map((k) => valueOf(env, k)))).map(
-    (r) => r.results?.[0]?.value ?? 0,
-  );
+  const [until, household, everyone, neuronsToday, allocation] = (
+    await env.DB.batch<{ value: number }>([keys.member, keys.household, keys.everyone, keys.neurons, keys.allocation].map((k) => valueOf(env, k)))
+  ).map((r) => r.results?.[0]?.value ?? 0);
 
   const cached = until > deps.now;
   if (cached) {
@@ -165,30 +185,17 @@ export async function photoRequest(env: Env, request: Request, body: Record<stri
       throw e instanceof FirebaseAuthError && e.kind === 'unavailable' ? new PhotoHttpError(503, 'unavailable') : new PhotoHttpError(401, 'sign-in');
     }
   } else {
-    // The household, read as them: Firestore checks the token, the rules refuse anyone else.
-    const url = deps.firestoreUrl ?? env.FIRESTORE_URL;
-    const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, fetch: requestBudget().fetch(deps.fetch ?? ((u, i) => fetch(u, i))), ...(url ? { baseUrl: url } : {}) });
-    const doc = await db.get(`households/${checked.household}`).catch((e: unknown) => {
-      if (e instanceof FirestoreError && (e.code === 'permission-denied' || e.code === 'not-found')) return null;
-      if (e instanceof FirestoreError && e.code === 'unauthenticated') throw new PhotoHttpError(401, 'sign-in');
+    // The household read as them, as every portal call does (src/api.ts `caller`).
+    await memberHousehold(env, idToken, checked.household, claimed.email, { fetch: requestBudget().fetch(deps.fetch ?? ((u, i) => fetch(u, i))), firestoreUrl: deps.firestoreUrl }).catch((e: unknown) => {
+      if (e instanceof HouseholdRefusal) throw new PhotoHttpError(e.status, e.code);
+      // Firestore's quota or this request's read cap: handleApi answers it as what it is.
+      if (firestoreQuota(e) || refusedBy(e)) throw e;
       throw new PhotoHttpError(503, 'unavailable');
     });
-    const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
-    if (!members.includes(claimed.email)) throw new PhotoHttpError(403, 'not-member');
   }
 
-  let capped: ProductPhotoResponse['capped'];
-  let room = checked.photos.length;
-  if (everyone >= caps.everyone || neuronsToday >= caps.neurons) {
-    capped = 'everyone';
-    room = 0;
-  } else if (household >= caps.household) {
-    capped = 'household';
-    room = 0;
-  } else if (room > Math.min(caps.household - household, caps.everyone - everyone)) {
-    capped = caps.household - household <= caps.everyone - everyone ? 'household' : 'everyone';
-    room = Math.min(caps.household - household, caps.everyone - everyone);
-  }
+  // One photo a request (pwa-kit PRODUCT_PHOTO_LIMITS.photosPerRequest): it is read, or capped.
+  let capped: ProductPhotoResponse['capped'] = photoCapped({ household, everyone, neurons: neuronsToday, allocation: allocation > 0 }, caps) ?? undefined;
 
   let neurons = 0;
   let read = 0;
@@ -198,8 +205,8 @@ export async function photoRequest(env: Env, request: Request, body: Record<stri
   const models = new Set<string>();
   const readOne = (dataUrl: string) => (env.SELF ? env.SELF.photo(dataUrl, checked.categories) : readOnePhoto(env, dataUrl, checked.categories));
   const photos: PhotoAnswer[] = await Promise.all(
-    checked.photos.map(async (dataUrl, i): Promise<PhotoAnswer> => {
-      if (i >= room) return { capped: true };
+    checked.photos.map(async (dataUrl): Promise<PhotoAnswer> => {
+      if (capped) return { capped: true };
       const answer = await readOne(dataUrl).catch((): OnePhoto => ({ error: 'failed' }));
       if ('products' in answer) {
         read++;
@@ -223,7 +230,7 @@ export async function photoRequest(env: Env, request: Request, body: Record<stri
   if (!cached) writes.push(env.DB.prepare('INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(keys.member, deps.now + MEMBER_TTL_MS));
   if (read) writes.push(add(env, keys.household, read), add(env, keys.everyone, read));
   if (neurons > 0) writes.push(add(env, keys.neurons, Math.ceil(neurons)));
-  if (exhausted) writes.push(env.DB.prepare('INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = MAX(value, ?2)').bind(keys.everyone, caps.everyone));
+  if (exhausted) writes.push(env.DB.prepare('INSERT INTO meta (key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1').bind(keys.allocation));
   if (writes.length) await env.DB.batch(writes);
   const left = Math.max(0, caps.household - household - read);
   log('photo', {
@@ -244,7 +251,9 @@ export async function photoRequest(env: Env, request: Request, body: Record<stri
 /** Old days' counts and expired member checks (src/tick.ts, hourly). */
 export async function forgetPhotos(env: Env, now: number): Promise<void> {
   const yesterday = photoDay(now - 86_400_000);
-  await env.DB.prepare("DELETE FROM meta WHERE (key LIKE 'photo-member:%' AND value < ?1) OR (key LIKE 'photo:%' AND key < ?2) OR (key LIKE 'photo-neurons:%' AND key < ?3)")
-    .bind(now, `photo:${yesterday}`, `photo-neurons:${yesterday}`)
+  await env.DB.prepare(
+    "DELETE FROM meta WHERE (key LIKE 'photo-member:%' AND value < ?1) OR (key LIKE 'photo:%' AND key < ?2) OR (key LIKE 'photo-neurons:%' AND key < ?3) OR (key LIKE 'photo-allocation:%' AND key < ?4)",
+  )
+    .bind(now, `photo:${yesterday}`, `photo-neurons:${yesterday}`, `photo-allocation:${yesterday}`)
     .run();
 }

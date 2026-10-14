@@ -3,7 +3,7 @@ import { expectReads } from '@huishouden/pwa-kit/read-test';
 import answers from './fixtures/photo-model-answers.json';
 import { handleApi } from '../src/api';
 import { captureLogs } from '../src/log';
-import { forgetPhotos, MEMBER_TTL_MS, PHOTO_FALLBACK_MODEL, PHOTO_MODEL, photoCap, photoDay } from '../src/photo';
+import { forgetPhotos, MEMBER_TTL_MS, PHOTO_FALLBACK_MODEL, PHOTO_MODEL, photoCap, photoCapped, photoDay } from '../src/photo';
 import { apiRequest, FIRESTORE, household, resetFirestore, seed, world, writeDoc, type World } from './helpers/world';
 
 // Add by photo (src/photo.ts): a member's photos read by a stand-in for Workers AI, on the fixture
@@ -99,12 +99,38 @@ describe('who may', () => {
     expect(calls).toHaveLength(0);
   });
 
-  test('a member is remembered for an hour; someone removed is refused after it', async () => {
+  test('a member is remembered for MEMBER_TTL_MS; someone removed is refused after it', async () => {
     await read('bob@example.com', 1);
     await writeDoc(`households/${household}`, { name: 'Home', members: ['alice@example.com'], joined: ['alice@example.com'], createdAt: 1 });
     expect((await post('bob@example.com', { photos: [photo(2)] })).status).toBe(200);
     w.clock.now += MEMBER_TTL_MS + 1;
     expect((await post('bob@example.com', { photos: [photo(3)] })).status).toBe(403);
+  });
+
+  test('a household that is not an id (a path to another document) is refused before anything is read', async () => {
+    const res = await post('alice@example.com', { household: `${household}/lists/x`, photos: [photo(1)] });
+    expect(res.status).toBe(400);
+    expect((await res.json()) as unknown).toEqual({ error: 'household' });
+    expect(calls).toHaveLength(0);
+  });
+
+  test('a body over a megabyte: 413, whether or not it says its length', async () => {
+    const big = { household, categories: SECTIONS, photos: [`data:image/jpeg;base64,${'A'.repeat(1_100_000)}`] };
+    const res = await handleApi(w.env, apiRequest('/api/photo/products', 'alice@example.com', big), undefined, { fetch: w.fetch, now: w.clock.now, firestoreUrl: FIRESTORE });
+    expect(res.status).toBe(413);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("Firestore's daily quota on the member check is answered as the quota, not an outage", async () => {
+    const quota = async (url: string, init?: RequestInit) =>
+      url.includes('/documents/')
+        ? Response.json({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded.' } }, { status: 429 })
+        : w.fetch(url, init);
+    const res = await post('alice@example.com', { photos: [photo(1)] }, quota);
+    expect(res.status).toBe(503);
+    expect((await res.json()) as unknown).toEqual({ error: 'firestore-quota' });
+    expect(res.headers.get('Retry-After')).toBe('3600');
+    expect(calls).toHaveLength(0);
   });
 
   test('a bad request says which part, before the model', async () => {
@@ -149,9 +175,23 @@ describe('caps', () => {
     script = [new Error("4006: you have used up your daily free allocation of 10,000 neurons, please upgrade to Cloudflare's Workers Paid plan")];
     expect(await read('alice@example.com', 1)).toEqual({ photos: [{ capped: true }], capped: 'everyone', left: 5 });
     expect(calls).toHaveLength(1);
+    // Kept apart from the photo count: raising PHOTO_DAILY doesn't lift it.
+    expect(await counted(`photo:${photoDay(w.clock.now)}`)).toBe(0);
+    Object.assign(w.env, { PHOTO_DAILY: '500' });
     expect((await read('bob@example.com', 2)).photos).toEqual([{ capped: true }]);
     w.clock.now += 86_400_000;
     expect((await read('bob@example.com', 2)).photos[0]).toHaveProperty('products');
+  });
+
+  test('whose cap: everyone first (photos, neurons, Workers AI), then the household', () => {
+    const caps = { household: 25, everyone: 150, neurons: 6000 };
+    const day = { household: 0, everyone: 0, neurons: 0, allocation: false };
+    expect(photoCapped(day, caps)).toBeNull();
+    expect(photoCapped({ ...day, household: 25 }, caps)).toBe('household');
+    expect(photoCapped({ ...day, household: 25, everyone: 150 }, caps)).toBe('everyone');
+    expect(photoCapped({ ...day, neurons: 6000 }, caps)).toBe('everyone');
+    expect(photoCapped({ ...day, allocation: true }, caps)).toBe('everyone');
+    expect(photoCapped({ ...day, household: 24, everyone: 149, neurons: 5999 }, caps)).toBeNull();
   });
 
   test('a cap that is not a number fails loudly', () => {
@@ -164,6 +204,9 @@ describe('caps', () => {
     await read('alice@example.com', 1);
     const before = (await w.env.DB.prepare("SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'photo%'").first<{ n: number }>())!.n;
     expect(before).toBe(4);
+    script = [new Error('4006: daily free allocation used')];
+    await read('alice@example.com', 2);
+    expect(await counted(`photo-allocation:${photoDay(w.clock.now)}`)).toBe(1);
     await forgetPhotos(w.env, w.clock.now + 2 * 86_400_000);
     expect((await w.env.DB.prepare("SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'photo%'").first<{ n: number }>())!.n).toBe(0);
   });
@@ -180,7 +223,14 @@ describe('privacy and reads', () => {
     for (const secret of ['base64', 'invented photo', 'Coffee mate', 'Reddi-wip', household, 'alice']) expect(all).not.toContain(secret);
   });
 
-  test("one Firestore read for a member's first photo in an hour (the household), none for the next", async () => {
+  test('requests sent before any answer each read the household once (the app sends its first alone)', async () => {
+    await expectReads(async (meter) => {
+      const all = await Promise.all([1, 2, 3].map((i) => post('alice@example.com', { photos: [photo(i)] }, meter(w.fetch))));
+      expect(all.map((r) => r.status)).toEqual([200, 200, 200]);
+    }, { max: 3, min: 3, label: 'Add by photo, three sent at once' });
+  });
+
+  test("one Firestore read for a member's first photo in MEMBER_TTL_MS (the household), none for the next", async () => {
     await expectReads(async (meter) => {
       expect((await post('alice@example.com', { photos: [photo(1)] }, meter(w.fetch))).status).toBe(200);
     }, { max: 1, min: 1, label: 'Add by photo, first photo' });

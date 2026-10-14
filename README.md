@@ -436,9 +436,12 @@ has counts only (photos, products, neurons, the model, whether the member check 
 never the photo, a name read from it, the household or the person. Cloudflare does not train
 models on Workers AI inputs. The portal's privacy page says so in every language.
 
-**Who.** A member of the household, any role: the household read as them (Firestore checks the
-token, the rules refuse anyone else), then remembered for an hour in D1 (`photo-member:<hash>`),
-with the token checked by Firebase Auth meanwhile. A session of photos costs one Firestore read.
+**Who.** A member of the household, any role: the household read as them, as every portal call
+does (`memberHousehold`: Firestore checks the token, the rules refuse anyone else), then remembered
+for 10 minutes in D1 (`photo-member:<hash>`), with the token checked by Firebase Auth meanwhile. A
+session of photos costs one Firestore read, because the app sends the first photo alone and the
+rest after its answer; requests sent before any answer read once each. Someone removed from the
+household can still spend its photos (never read its data) until their remembered check expires.
 
 **The model.** `@cf/mistralai/mistral-small-3.1-24b-instruct` with a JSON schema for the answer
 (the sections as an enum); `@cf/meta/llama-4-scout-17b-16e-instruct` once if it fails. Compared on
@@ -478,7 +481,8 @@ read adds about 1 neuron. At 28.7 a photo, the free 10,000 neurons are about 350
 Production and staging share the account's one free allocation: their ceilings together are 8,000
 of the 10,000. A photo is counted once read (one the model couldn't read costs nothing), so a burst
 can pass a cap by the photos in flight, three at most a household. When Workers AI says the
-allocation is used up (error 4006), everyone is capped until the next UTC day. A capped answer says
+allocation is used up (error 4006), everyone is capped until the next UTC day (`photo-allocation:<day>`,
+apart from the photo counts). A capped answer says
 whose cap (`household` or `everyone`), and the app offers typing instead.
 
 **CPU.** Handing a photo to Workers AI costs the invocation a few milliseconds, so each photo goes

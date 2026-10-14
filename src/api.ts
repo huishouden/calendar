@@ -1,13 +1,13 @@
 import { firestoreQuota, refusedBy, requestBudget } from './budget';
 import { exchangeRefreshToken, FirebaseAuthError } from '@huishouden/pwa-kit/firebase-auth-rest';
-import { FirestoreError, FirestoreRest } from '@huishouden/pwa-kit/firestore-rest';
+import { FirestoreError } from '@huishouden/pwa-kit/firestore-rest';
 import { isLang, type Lang } from '@huishouden/pwa-kit/i18n';
 import { isTimeZone } from '@huishouden/pwa-kit/local-clock';
 import { householdTimeZone, toHome } from '@huishouden/pwa-kit/home';
 import type { Env, Fetch } from './env';
 import { feedUrl } from './feed';
 import { log } from './log';
-import { authOptions, claimedPerson, roleOf } from './person';
+import { authOptions, claimedPerson, HOUSEHOLD_ID, HouseholdRefusal, memberHousehold, roleOf } from './person';
 import { Calendar, CalendarApiError } from './google/api';
 import { accessToken, CALENDAR_SCOPE, exchangeCode, GoogleAuthError, redirectUriFor, revokeGoogle } from './google/oauth';
 import { deletePerson, deletePersonRows, loadPerson, moveFeed, newFeed, personId, personRow, revokeFeed, savePerson, upsertPersonRow, type PersonRecord } from './store';
@@ -85,7 +85,6 @@ interface Caller {
   homeZone?: string;
 }
 
-const HOUSEHOLD = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
  * 503, saying which: `firestore-quota` (the project's day is used up: back after the daily reset;
@@ -100,31 +99,29 @@ export const readFailure = (e: unknown): 'firestore-quota' | 'read-budget' | nul
 async function caller(env: Env, request: Request, household: string | null, fetchImpl: Fetch | undefined, firestoreUrl?: string): Promise<Caller> {
   const idToken = /^Bearer (.+)$/.exec(request.headers.get('Authorization') ?? '')?.[1];
   if (!idToken) throw new HttpError(401, 'sign-in');
-  if (!household || !HOUSEHOLD.test(household)) throw new HttpError(400, 'household');
+  if (!household || !HOUSEHOLD_ID.test(household)) throw new HttpError(400, 'household');
   // Who the token says, read without a call: Firestore checks the token itself (signature, project,
   // expiry) on the household read below, which fails with 401 for anything forged or stale. Before,
   // a separate Firebase Auth lookup did that check, one more subrequest per call.
   const who = claimedPerson(env, idToken);
   if (!who) throw new HttpError(401, 'sign-in');
-  // A member reads their household; anyone else is refused by the rules.
-  // A member's own request: counted and capped (src/budget.ts `requestBudget`).
-  const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, fetch: requestBudget().fetch(fetchImpl ?? ((url, init) => fetch(url, init))), ...((firestoreUrl ?? env.FIRESTORE_URL) ? { baseUrl: firestoreUrl ?? env.FIRESTORE_URL } : {}) });
-  // Only the rules' refusal (or no such household) means "not a member". Anything else, such as
-  // Firestore's daily quota (429 RESOURCE_EXHAUSTED) or an outage, is the service being unavailable.
-  const doc = await db.get(`households/${household}`).catch((e: unknown) => {
-    if (e instanceof FirestoreError && (e.code === 'permission-denied' || e.code === 'not-found')) return null;
-    if (e instanceof FirestoreError && e.code === 'unauthenticated') throw new HttpError(401, 'sign-in');
+  // A member reads their household; anyone else is refused by the rules. A member's own request:
+  // counted and capped (src/budget.ts `requestBudget`). Firestore's quota or an outage is the
+  // service being unavailable, not "not a member".
+  const doc = await memberHousehold(env, idToken, household, who.email, { fetch: requestBudget().fetch(fetchImpl ?? ((url, init) => fetch(url, init))), firestoreUrl }).catch((e: unknown) => {
+    if (e instanceof HouseholdRefusal) throw new HttpError(e.status, e.code);
     throw unavailable(e);
   });
-  const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
-  if (!members.includes(who.email)) throw new HttpError(403, 'not-member');
-  const homeZone = toHome(doc!.data.home)?.timeZone;
-  return { ...who, household, pid: await personId(household, who.email), idToken, role: roleOf(doc!.data, who.email), ...(homeZone ? { homeZone } : {}) };
+  const homeZone = toHome(doc.data.home)?.timeZone;
+  return { ...who, household, pid: await personId(household, who.email), idToken, role: roleOf(doc.data, who.email), ...(homeZone ? { homeZone } : {}) };
 }
 
 async function body(request: Request): Promise<Record<string, unknown>> {
+  // A body sent without Content-Length (chunked) is measured as read.
+  const text = await request.text();
+  if (text.length > MAX_BODY_BYTES) throw new HttpError(413, 'too-large');
   try {
-    const b = (await request.json()) as unknown;
+    const b = JSON.parse(text) as unknown;
     return b && typeof b === 'object' ? (b as Record<string, unknown>) : {};
   } catch {
     throw new HttpError(400, 'body');
