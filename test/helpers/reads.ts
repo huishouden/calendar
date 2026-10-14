@@ -17,6 +17,7 @@ export function throughMeter(w: World, fetch: Fetch) {
     work: (pid, handover) => runWork(env, pid, { fetch, now: w.clock.now, handover, next: (p, h) => env.SELF!.work(p, h) }),
     mail: (ids) => checkInboxes(env, ids, { fetch, now: w.clock.now, firestoreUrl: FIRESTORE }),
     mailWork: (id) => runMailWork(env, id, { fetch, now: w.clock.now, firestoreUrl: FIRESTORE, next: (i) => env.SELF!.mailWork(i) }),
+    photo: self.photo,
   };
   return {
     /** The queue run as the consumer does, every unit through `fetch`. */

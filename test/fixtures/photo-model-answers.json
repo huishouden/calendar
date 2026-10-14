@@ -1,0 +1,10 @@
+{
+  "creamerAndWhipped": {
+    "response": { "products": [{ "category": "Dairy & Eggs", "name": "Coffee mate Italian Sweet Crème creamer, Zero Sugar" }, { "category": "Dairy & Eggs", "name": "Reddi-wip Original Whipped Topping" }] },
+    "usage": { "prompt_tokens": 819, "completion_tokens": 53, "total_tokens": 872, "prompt_tokens_details": { "cached_tokens": 0 }, "neurons": 28.78230857849121 }
+  },
+  "threeProducts": {
+    "response": "```json\n{\"products\": [{\"name\": \"Barilla Spaghetti n.5\", \"category\": \"Pantry & Dry Goods\"}, {\"name\": \"HEINZ TOMATO KETCHUP\", \"category\": \"Pantry & Dry Goods\"}, {\"name\": \"Reddi-wip Original Whipped Topping Made With Real Cream\", \"category\": \"Dairy & Eggs\"}]}\n```",
+    "usage": { "prompt_tokens": 819, "completion_tokens": 72, "total_tokens": 891 }
+  }
+}

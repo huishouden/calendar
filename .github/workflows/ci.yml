@@ -20,8 +20,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: huishouden/pwa-kit/actions/leak-scan@37de59808bc78b02d4d03f46b48d9d1357ce71f0 # v0.118.0
-      - uses: huishouden/pwa-kit/actions/license-check@37de59808bc78b02d4d03f46b48d9d1357ce71f0 # v0.118.0 PolyForm Shield 1.0.0 (pwa-kit STANDARD.md "License")
+      - uses: huishouden/pwa-kit/actions/leak-scan@09ceb62dcbe9415a1c81b9f279ab1391c41769cb # v0.123.0
+      - uses: huishouden/pwa-kit/actions/license-check@09ceb62dcbe9415a1c81b9f279ab1391c41769cb # v0.123.0 PolyForm Shield 1.0.0 (pwa-kit STANDARD.md "License")
 
   # The sync and the feed run against the Firestore emulator with the household's real rules
   # (huishouden/rules main), with Google and Firebase Auth faked.
@@ -58,7 +58,7 @@ jobs:
   release:
     needs: [leak-scan, build]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-    uses: huishouden/pwa-kit/.github/workflows/tag-release.yml@37de59808bc78b02d4d03f46b48d9d1357ce71f0 # v0.118.0
+    uses: huishouden/pwa-kit/.github/workflows/tag-release.yml@09ceb62dcbe9415a1c81b9f279ab1391c41769cb # v0.123.0
     permissions:
       contents: write
 

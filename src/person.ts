@@ -1,4 +1,4 @@
-import { exchangeRefreshToken, FirebaseAuthError, IdTokenCache, type AuthRestOptions } from '@huishouden/pwa-kit/firebase-auth-rest';
+import { exchangeRefreshToken, FirebaseAuthError, IdTokenCache, jwtClaims, type AuthRestOptions } from '@huishouden/pwa-kit/firebase-auth-rest';
 import { decodeFields, FirestoreError, FirestoreRest, type Doc, type FieldFilter } from '@huishouden/pwa-kit/firestore-rest';
 import type { ReadBudget } from '@huishouden/pwa-kit/read-budget';
 import { PERSONAL_AGENDA, toAgendaItem, type AgendaItem } from '@huishouden/pwa-kit/agenda-core';
@@ -345,3 +345,55 @@ export const signalFrom = (view: View, tallies: Tally[], extra: string): string 
 
 /** Whether an error means the person's sign-in is gone for good (signed out everywhere, account disabled). */
 export const signInGone = (e: unknown): boolean => e instanceof FirebaseAuthError && e.kind === 'revoked';
+
+/** The token's person (uid, verified email) if its claims are for this project and unexpired; null otherwise. */
+export function claimedPerson(env: Pick<Env, 'FIREBASE_PROJECT_ID'>, idToken: string, now = Date.now()): { uid: string; email: string } | null {
+  let claims: Record<string, unknown>;
+  try {
+    claims = jwtClaims(idToken);
+  } catch {
+    return null;
+  }
+  if (claims.aud !== env.FIREBASE_PROJECT_ID || claims.iss !== `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) return null;
+  if (typeof claims.exp !== 'number' || claims.exp * 1000 <= now) return null;
+  const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
+  const uid = typeof claims.user_id === 'string' ? claims.user_id : typeof claims.sub === 'string' ? claims.sub : '';
+  if (!email || !uid || claims.email_verified !== true) return null;
+  return { uid, email };
+}
+
+/** The household read refused the caller: 401 (the token isn't good) or 403 (not a member). */
+export class HouseholdRefusal extends Error {
+  constructor(
+    readonly status: 401 | 403,
+    readonly code: 'sign-in' | 'not-member',
+  ) {
+    super(code);
+  }
+}
+
+/** The ID token's household id format: what `households/{id}` takes, and nothing that could name another path. */
+export const HOUSEHOLD_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * The household read as the token's person, for a portal or app request: Firestore checks the token
+ * (signature, project, expiry), the rules refuse anyone who isn't a member, and `email` must be in
+ * `members`. Throws `HouseholdRefusal` for those; any other failure (Firestore's quota, the
+ * request's read cap, an outage) is rethrown as it is, for the caller to classify. One billed read,
+ * through `fetch` (the request's `ReadBudget`).
+ */
+export async function memberHousehold(env: Pick<Env, 'FIREBASE_PROJECT_ID' | 'FIRESTORE_URL'>, idToken: string, household: string, email: string, { fetch: fetchImpl, firestoreUrl }: { fetch: Fetch; firestoreUrl?: string }): Promise<Doc> {
+  if (!HOUSEHOLD_ID.test(household)) throw new HouseholdRefusal(403, 'not-member');
+  const url = firestoreUrl ?? env.FIRESTORE_URL;
+  const db = new FirestoreRest({ projectId: env.FIREBASE_PROJECT_ID, token: async () => idToken, fetch: fetchImpl, ...(url ? { baseUrl: url } : {}) });
+  // Only the rules' refusal (or no such household) means "not a member".
+  const doc = await db.get(`households/${household}`).catch((e: unknown) => {
+    if (e instanceof FirestoreError && (e.code === 'permission-denied' || e.code === 'not-found')) return null;
+    if (e instanceof FirestoreError && e.code === 'unauthenticated') throw new HouseholdRefusal(401, 'sign-in');
+    throw e;
+  });
+  const members = Array.isArray(doc?.data.members) ? (doc!.data.members as unknown[]) : [];
+  if (!doc || !members.includes(email)) throw new HouseholdRefusal(403, 'not-member');
+  return doc;
+}
+

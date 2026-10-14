@@ -11,6 +11,7 @@ import { FakeGmail } from './gmail';
 import { checkInboxes } from '../../src/mail/check';
 import { runMailWork } from '../../src/mail/work';
 import { memoryD1, memoryKV } from './d1';
+import { readOnePhoto } from '../../src/photo';
 import fixture from '../fixtures/household.json';
 
 /** A refresh token the fake Firebase Auth signs in as `email` with. */
@@ -168,6 +169,7 @@ export function world(): World {
     work: (pid, handover) => runWork(env, pid, { fetch: fakeFetch, now: clock.now, handover, next: (p, h) => env.SELF!.work(p, h) }),
     mail: (ids) => checkInboxes(env, ids, { fetch: fakeFetch, now: clock.now, firestoreUrl: FIRESTORE }),
     mailWork: (id) => runMailWork(env, id, { fetch: fakeFetch, now: clock.now, firestoreUrl: FIRESTORE, next: (i) => env.SELF!.mailWork(i) }),
+    photo: (dataUrl, categories) => readOnePhoto(env, dataUrl, categories),
   };
   return { env, google, gmail, fetch: fakeFetch, clock, authCalls, queue, queueFull };
 }

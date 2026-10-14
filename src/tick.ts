@@ -4,6 +4,7 @@ import { checkPeople, QUIET_EVERY_MIN, type CheckTotals } from './check';
 import { forgetLists } from './lists';
 import { forgetRounds } from './store';
 import { forgetWorkReads } from './budget';
+import { forgetPhotos } from './photo';
 import { markWork, REQUEUE_MS, runWork, type WorkOutcome } from './work';
 
 /**
@@ -206,6 +207,7 @@ export async function runPart(env: Env, deps: TickDeps & { part: number }): Prom
     await forgetLists(env, now).catch(() => undefined);
     await forgetRounds(env, now).catch(() => undefined);
     await forgetWorkReads(env, now).catch(() => undefined);
+    await forgetPhotos(env, now).catch(() => undefined);
   }
 
   // The portal's "Updated ... ago" for everyone checked in this minute, when all of them were.

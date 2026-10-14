@@ -50,6 +50,7 @@ async function get(secret: string, headers: Record<string, string> = {}, method 
     check: async (pids) => (checksAsked.push(pids), { checked: 0, marked: 0, sent: 0, echoes: 0, skipped: 0, errors: 0, deferred: [], paused: false, quiet: 0 }),
     mail: self.mail,
     mailWork: self.mailWork,
+    photo: self.photo,
     work: async (pid, handover) => {
       inSelf++;
       try {
