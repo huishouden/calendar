@@ -191,7 +191,7 @@ export async function handleApi(env: Env, request: Request, ctx: ExecutionContex
   try {
     if (Number(request.headers.get('Content-Length') ?? 0) > MAX_BODY_BYTES) throw new HttpError(413, 'too-large');
     const b = request.method === 'POST' ? await body(request) : {};
-    // Add by photo checks its caller itself: Firebase Auth, and membership remembered for an hour (src/photo.ts).
+    // Add by photo checks its caller itself: the same household read, then remembered for MEMBER_TTL_MS (10 minutes, src/photo.ts).
     if (request.method === 'POST' && url.pathname === PRODUCT_PHOTO_PATH) return json(200, await photoRequest(env, request, b, { fetch: fetchImpl, now, firestoreUrl: deps.firestoreUrl }), headers);
     const household = request.method === 'GET' ? url.searchParams.get('household') : typeof b.household === 'string' ? b.household : null;
     const who = await caller(env, request, household, fetchImpl, deps.firestoreUrl);
